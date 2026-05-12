@@ -27,7 +27,10 @@ impl<'de> Deserialize<'de> for AllowBots {
             "off" | "none" | "false" => Ok(Self::Off),
             "mentions" => Ok(Self::Mentions),
             "all" | "true" => Ok(Self::All),
-            other => Err(serde::de::Error::unknown_variant(other, &["off", "mentions", "all"])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["off", "mentions", "all"],
+            )),
         }
     }
 }
@@ -48,6 +51,8 @@ pub struct Config {
     pub markdown: MarkdownConfig,
     #[serde(default)]
     pub cron: CronConfig,
+    #[serde(default)]
+    pub uploads: UploadsConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -85,8 +90,12 @@ impl Default for SttConfig {
     }
 }
 
-fn default_stt_model() -> String { "whisper-large-v3-turbo".into() }
-fn default_stt_base_url() -> String { "https://api.groq.com/openai/v1".into() }
+fn default_stt_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+fn default_stt_base_url() -> String {
+    "https://api.groq.com/openai/v1".into()
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
@@ -122,7 +131,9 @@ pub struct DiscordConfig {
     pub allow_dm: bool,
 }
 
-fn default_max_bot_turns() -> u32 { 20 }
+fn default_max_bot_turns() -> u32 {
+    20
+}
 
 /// Controls whether the bot responds to user messages in threads without @mention.
 ///
@@ -147,7 +158,10 @@ impl<'de> Deserialize<'de> for AllowUsers {
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
-            other => Err(serde::de::Error::unknown_variant(other, &["involved", "mentions", "multibot-mentions"])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["involved", "mentions", "multibot-mentions"],
+            )),
         }
     }
 }
@@ -224,6 +238,24 @@ pub struct AgentConfig {
     pub inherit_env: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadsConfig {
+    /// Allow agent replies to request local file uploads via fenced directives.
+    /// Disabled by default because OpenAB runs outside the child-process sandbox.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Canonical path prefixes that may be uploaded. Empty means the agent
+    /// working_dir is used at startup when uploads are enabled.
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+    /// Max number of files a single agent response may upload.
+    #[serde(default = "default_upload_max_files")]
+    pub max_files: usize,
+    /// Max size of each file in bytes.
+    #[serde(default = "default_upload_max_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PoolConfig {
     #[serde(default = "default_max_sessions")]
@@ -256,9 +288,15 @@ pub struct CronJobConfig {
     pub timezone: String,
 }
 
-fn default_cron_platform() -> String { "discord".into() }
-fn default_cron_sender() -> String { "openab-cron".into() }
-fn default_cron_timezone() -> String { "UTC".into() }
+fn default_cron_platform() -> String {
+    "discord".into()
+}
+fn default_cron_sender() -> String {
+    "openab-cron".into()
+}
+fn default_cron_timezone() -> String {
+    "UTC".into()
+}
 
 /// Controls how tool calls are rendered in chat messages.
 ///
@@ -280,7 +318,10 @@ impl<'de> Deserialize<'de> for ToolDisplay {
             "full" => Ok(Self::Full),
             "compact" => Ok(Self::Compact),
             "none" | "off" | "hidden" => Ok(Self::None),
-            other => Err(serde::de::Error::unknown_variant(other, &["full", "compact", "none"])),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["full", "compact", "none"],
+            )),
         }
     }
 }
@@ -333,28 +374,80 @@ pub struct ReactionTiming {
 
 // --- defaults ---
 
-fn default_working_dir() -> String { "/tmp".into() }
-fn default_max_sessions() -> usize { 10 }
-fn default_ttl_hours() -> u64 { 4 }
-fn default_true() -> bool { true }
+fn default_working_dir() -> String {
+    "/tmp".into()
+}
+fn default_max_sessions() -> usize {
+    10
+}
+fn default_ttl_hours() -> u64 {
+    4
+}
+fn default_true() -> bool {
+    true
+}
 
-fn emoji_queued() -> String { "👀".into() }
-fn emoji_thinking() -> String { "🤔".into() }
-fn emoji_tool() -> String { "🔥".into() }
-fn emoji_coding() -> String { "👨‍💻".into() }
-fn emoji_web() -> String { "⚡".into() }
-fn emoji_done() -> String { "🆗".into() }
-fn emoji_error() -> String { "😱".into() }
+fn emoji_queued() -> String {
+    "👀".into()
+}
+fn emoji_thinking() -> String {
+    "🤔".into()
+}
+fn emoji_tool() -> String {
+    "🔥".into()
+}
+fn emoji_coding() -> String {
+    "👨‍💻".into()
+}
+fn emoji_web() -> String {
+    "⚡".into()
+}
+fn emoji_done() -> String {
+    "🆗".into()
+}
+fn emoji_error() -> String {
+    "😱".into()
+}
 
-fn default_debounce_ms() -> u64 { 700 }
-fn default_stall_soft_ms() -> u64 { 10_000 }
-fn default_stall_hard_ms() -> u64 { 30_000 }
-fn default_done_hold_ms() -> u64 { 1_500 }
-fn default_error_hold_ms() -> u64 { 2_500 }
+fn default_debounce_ms() -> u64 {
+    700
+}
+fn default_stall_soft_ms() -> u64 {
+    10_000
+}
+fn default_stall_hard_ms() -> u64 {
+    30_000
+}
+fn default_done_hold_ms() -> u64 {
+    1_500
+}
+fn default_error_hold_ms() -> u64 {
+    2_500
+}
+fn default_upload_max_files() -> usize {
+    10
+}
+fn default_upload_max_file_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+impl Default for UploadsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_roots: Vec::new(),
+            max_files: default_upload_max_files(),
+            max_file_bytes: default_upload_max_file_bytes(),
+        }
+    }
+}
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+        Self {
+            max_sessions: default_max_sessions(),
+            session_ttl_hours: default_ttl_hours(),
+        }
     }
 }
 
@@ -373,8 +466,13 @@ impl Default for ReactionsConfig {
 impl Default for ReactionEmojis {
     fn default() -> Self {
         Self {
-            queued: emoji_queued(), thinking: emoji_thinking(), tool: emoji_tool(),
-            coding: emoji_coding(), web: emoji_web(), done: emoji_done(), error: emoji_error(),
+            queued: emoji_queued(),
+            thinking: emoji_thinking(),
+            tool: emoji_tool(),
+            coding: emoji_coding(),
+            web: emoji_web(),
+            done: emoji_done(),
+            error: emoji_error(),
         }
     }
 }
@@ -382,8 +480,10 @@ impl Default for ReactionEmojis {
 impl Default for ReactionTiming {
     fn default() -> Self {
         Self {
-            debounce_ms: default_debounce_ms(), stall_soft_ms: default_stall_soft_ms(),
-            stall_hard_ms: default_stall_hard_ms(), done_hold_ms: default_done_hold_ms(),
+            debounce_ms: default_debounce_ms(),
+            stall_soft_ms: default_stall_soft_ms(),
+            stall_hard_ms: default_stall_hard_ms(),
+            done_hold_ms: default_done_hold_ms(),
             error_hold_ms: default_error_hold_ms(),
         }
     }
@@ -475,6 +575,29 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+        assert!(!cfg.uploads.enabled);
+    }
+
+    #[test]
+    fn parse_uploads_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[uploads]
+enabled = true
+allowed_roots = ["/tmp/openab"]
+max_files = 3
+max_file_bytes = 1234
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.uploads.enabled);
+        assert_eq!(cfg.uploads.allowed_roots, vec!["/tmp/openab"]);
+        assert_eq!(cfg.uploads.max_files, 3);
+        assert_eq!(cfg.uploads.max_file_bytes, 1234);
     }
 
     #[test]
@@ -510,7 +633,10 @@ command = "echo"
     fn parse_invalid_toml_returns_error() {
         let result = parse_config("not valid toml {{{}}", "test");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to parse config from test"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to parse config from test"));
     }
 
     #[test]
@@ -532,7 +658,10 @@ command = "echo"
     async fn load_config_from_url_invalid_host() {
         let result = load_config_from_url("https://invalid.test.example/config.toml").await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("failed to fetch remote config"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to fetch remote config"));
     }
 
     #[test]
@@ -554,7 +683,10 @@ command = "echo"
         assert!(gw.allow_all_channels.is_none());
         // resolve_allow_all: empty lists → allow all
         assert!(resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
-        assert!(resolve_allow_all(gw.allow_all_channels, &gw.allowed_channels));
+        assert!(resolve_allow_all(
+            gw.allow_all_channels,
+            &gw.allowed_channels
+        ));
     }
 
     #[test]
@@ -576,7 +708,10 @@ command = "echo"
         assert_eq!(gw.allowed_channels, vec!["C1"]);
         // resolve_allow_all: non-empty lists → restricted
         assert!(!resolve_allow_all(gw.allow_all_users, &gw.allowed_users));
-        assert!(!resolve_allow_all(gw.allow_all_channels, &gw.allowed_channels));
+        assert!(!resolve_allow_all(
+            gw.allow_all_channels,
+            &gw.allowed_channels
+        ));
     }
 
     #[test]

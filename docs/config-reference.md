@@ -94,6 +94,32 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
+---
+
+## `[uploads]`
+
+Allows an agent response to ask OpenAB to upload local files through the chat adapter. This keeps platform tokens inside OpenAB instead of forwarding them to the agent subprocess.
+
+Agents request uploads with a fenced block in their final reply:
+
+````markdown
+Here are the screenshots.
+
+```openab-upload
+/absolute/path/to/contact_sheet.png
+/absolute/path/to/detail.png
+```
+````
+
+OpenAB strips the fenced block from the visible reply, validates every path, then uploads the files.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable upload directives. Disabled by default because OpenAB may have broader filesystem access than the agent subprocess. |
+| `allowed_roots` | string[] | agent `working_dir` when enabled and omitted | Canonical path prefixes that uploads must be under. |
+| `max_files` | usize | `10` | Max files a single agent response may upload. Discord also limits each message to 10 attachments. |
+| `max_file_bytes` | u64 | `26214400` | Max size of each uploaded file in bytes. |
+
 ### Agent examples
 
 ```toml

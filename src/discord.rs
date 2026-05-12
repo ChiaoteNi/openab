@@ -1,21 +1,27 @@
-use crate::acp::ContentBlock;
 use crate::acp::protocol::ConfigOption;
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::acp::ContentBlock;
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutgoingAttachment, SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::format;
 use crate::media;
 use async_trait::async_trait;
-use std::sync::LazyLock;
-use serenity::builder::{CreateActionRow, CreateButton, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditMessage};
-use serenity::model::application::ButtonStyle;
+use serenity::builder::{
+    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, CreateThread, EditMessage,
+};
 use serenity::http::Http;
+use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, ComponentInteractionDataKind, Interaction};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info};
 
@@ -57,9 +63,44 @@ impl ChatAdapter for DiscordAdapter {
         2000
     }
 
-    async fn send_message(&self, channel: &ChannelRef, content: &str) -> anyhow::Result<MessageRef> {
+    async fn send_message(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+    ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
+
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutgoingAttachment],
+    ) -> anyhow::Result<MessageRef> {
+        if attachments.is_empty() {
+            return self.send_message(channel, content).await;
+        }
+        if attachments.len() > 10 {
+            anyhow::bail!("Discord supports at most 10 attachments per message");
+        }
+
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let mut files = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            files.push(CreateAttachment::path(&attachment.path).await?);
+        }
+        let mut builder = CreateMessage::new().files(files);
+        if !content.is_empty() {
+            builder = builder.content(content);
+        }
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -179,11 +220,15 @@ impl Handler {
         // Check positive caches
         let cached_involved = {
             let cache = self.participated_threads.lock().await;
-            cache.get(&key).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            cache
+                .get(&key)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
         };
         let cached_multibot = {
             let cache = self.multibot_threads.lock().await;
-            cache.get(&key).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            cache
+                .get(&key)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
         };
 
         // Both cached → skip fetch entirely
@@ -210,7 +255,10 @@ impl Handler {
         };
 
         let involved = cached_involved || messages.iter().any(|m| m.author.id == bot_id);
-        let other_bot_present = cached_multibot || messages.iter().any(|m| m.author.bot && m.author.id != bot_id);
+        let other_bot_present = cached_multibot
+            || messages
+                .iter()
+                .any(|m| m.author.bot && m.author.id != bot_id);
 
         if involved && !cached_involved {
             let mut cache = self.participated_threads.lock().await;
@@ -275,7 +323,11 @@ impl EventHandler for Handler {
                 match tracker.classify_bot_message(&thread_key) {
                     TurnAction::Continue => {}
                     TurnAction::SilentStop => return,
-                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+                    TurnAction::WarnAndStop {
+                        severity,
+                        turns,
+                        user_message,
+                    } => {
                         match severity {
                             TurnSeverity::Hard => tracing::warn!(
                                 channel_id = %msg.channel_id,
@@ -339,27 +391,35 @@ impl EventHandler for Handler {
             return;
         }
 
-        let adapter = self.adapter.get_or_init(|| {
-            Arc::new(DiscordAdapter::new(ctx.http.clone()))
-        }).clone();
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
             self.allow_all_channels || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id));
+        let is_mentioned =
+            msg.mentions_user_id(bot_id) || msg.content.contains(&format!("<@{}>", bot_id));
 
         // Bot message gating (from upstream #321)
         if msg.author.bot {
             match self.allow_bot_messages {
                 AllowBots::Off => return,
-                AllowBots::Mentions => if !is_mentioned { return; },
+                AllowBots::Mentions => {
+                    if !is_mentioned {
+                        return;
+                    }
+                }
                 AllowBots::All => {
                     let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
-                    let history = ctx.cache.channel_messages(msg.channel_id)
+                    let history = ctx
+                        .cache
+                        .channel_messages(msg.channel_id)
                         .map(|msgs| {
-                            let mut recent: Vec<_> = msgs.iter()
+                            let mut recent: Vec<_> = msgs
+                                .iter()
                                 .filter(|(mid, _)| **mid < msg.id)
                                 .map(|(_, m)| m.clone())
                                 .collect();
@@ -372,8 +432,14 @@ impl EventHandler for Handler {
                     let recent = if let Some(cached) = history {
                         cached
                     } else {
-                        match msg.channel_id
-                            .messages(&ctx.http, serenity::builder::GetMessages::new().before(msg.id).limit(MAX_CONSECUTIVE_BOT_TURNS))
+                        match msg
+                            .channel_id
+                            .messages(
+                                &ctx.http,
+                                serenity::builder::GetMessages::new()
+                                    .before(msg.id)
+                                    .limit(MAX_CONSECUTIVE_BOT_TURNS),
+                            )
                             .await
                         {
                             Ok(msgs) => msgs,
@@ -384,17 +450,20 @@ impl EventHandler for Handler {
                         }
                     };
 
-                    let consecutive_bot = recent.iter()
+                    let consecutive_bot = recent
+                        .iter()
                         .take_while(|m| m.author.bot && m.author.id != bot_id)
                         .count();
                     if consecutive_bot >= cap {
                         tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
                         return;
                     }
-                },
+                }
             }
 
-            if !self.trusted_bot_ids.is_empty() && !self.trusted_bot_ids.contains(&msg.author.id.get()) {
+            if !self.trusted_bot_ids.is_empty()
+                && !self.trusted_bot_ids.contains(&msg.author.id.get())
+            {
                 tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
                 return;
             }
@@ -403,7 +472,11 @@ impl EventHandler for Handler {
         // Thread detection: single to_channel() call for both allowed and
         // non-allowed channels. Uses thread_metadata (not parent_id) to
         // identify threads — see detect_thread() doc comments for rationale.
-        let (in_thread, bot_owns_thread, thread_parent_id, is_dm) = match msg.channel_id.to_channel(&ctx.http).await {
+        let (in_thread, bot_owns_thread, thread_parent_id, is_dm) = match msg
+            .channel_id
+            .to_channel(&ctx.http)
+            .await
+        {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let result = detect_thread(
@@ -424,7 +497,12 @@ impl EventHandler for Handler {
                     bot_owns = ?result.1,
                     "thread check"
                 );
-                (result.0, result.1.unwrap_or(false), if result.0 { parent } else { None }, false)
+                (
+                    result.0,
+                    result.1.unwrap_or(false),
+                    if result.0 { parent } else { None },
+                    false,
+                )
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
                 tracing::debug!(channel_id = %msg.channel_id, "DM channel");
@@ -501,7 +579,12 @@ impl EventHandler for Handler {
             }
         }
 
-        if is_denied_user(msg.author.bot, self.allow_all_users, &self.allowed_users, msg.author.id.get()) {
+        if is_denied_user(
+            msg.author.bot,
+            self.allow_all_users,
+            &self.allowed_users,
+            msg.author.id.get(),
+        ) {
             tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
             let msg_ref = discord_msg_ref(&msg);
             let _ = adapter.add_reaction(&msg_ref, "🚫").await;
@@ -548,18 +631,24 @@ impl EventHandler for Handler {
                         u64::from(attachment.size),
                         &self.stt_config,
                         None,
-                    ).await {
+                    )
+                    .await
+                    {
                         debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
-                        extra_blocks.insert(0, ContentBlock::Text {
-                            text: format!("[Voice message transcript]: {transcript}"),
-                        });
+                        extra_blocks.insert(
+                            0,
+                            ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            },
+                        );
                     }
                 } else {
                     tracing::warn!(filename = %attachment.filename, "skipping audio attachment (STT disabled)");
                     let msg_ref = discord_msg_ref(&msg);
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                 }
-            } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref()) {
+            } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
+            {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
                     tracing::warn!(filename = %attachment.filename, count = text_file_count, "text file count cap reached, skipping");
                     continue;
@@ -575,7 +664,9 @@ impl EventHandler for Handler {
                     &attachment.filename,
                     u64::from(attachment.size),
                     None,
-                ).await {
+                )
+                .await
+                {
                     text_file_bytes += actual_bytes;
                     text_file_count += 1;
                     debug!(filename = %attachment.filename, "adding text file attachment");
@@ -587,7 +678,9 @@ impl EventHandler for Handler {
                 &attachment.filename,
                 u64::from(attachment.size),
                 None,
-            ).await {
+            )
+            .await
+            {
                 debug!(url = %attachment.url, filename = %attachment.filename, "adding image attachment");
                 extra_blocks.push(block);
             }
@@ -639,7 +732,15 @@ impl EventHandler for Handler {
         tokio::spawn(async move {
             let sender_json = serde_json::to_string(&sender).unwrap();
             if let Err(e) = router
-                .handle_message(&adapter, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+                .handle_message(
+                    &adapter,
+                    &thread_channel,
+                    &sender_json,
+                    &prompt,
+                    extra_blocks,
+                    &trigger_msg,
+                    other_bot_present,
+                )
                 .await
             {
                 error!("handle_message error: {e}");
@@ -652,14 +753,10 @@ impl EventHandler for Handler {
 
         // Build the shared command list once.
         let commands = vec![
-            CreateCommand::new("models")
-                .description("Select the AI model for this session"),
-            CreateCommand::new("agents")
-                .description("Select the agent mode for this session"),
-            CreateCommand::new("cancel")
-                .description("Cancel the current operation"),
-            CreateCommand::new("reset")
-                .description("Reset the conversation session"),
+            CreateCommand::new("models").description("Select the AI model for this session"),
+            CreateCommand::new("agents").description("Select the agent mode for this session"),
+            CreateCommand::new("cancel").description("Cancel the current operation"),
+            CreateCommand::new("reset").description("Reset the conversation session"),
         ];
 
         // Register global commands (works in DMs + all guilds after propagation).
@@ -672,10 +769,7 @@ impl EventHandler for Handler {
         // Also register per-guild for instant availability (global can take up to 1h).
         for guild in &ready.guilds {
             let guild_id = guild.id;
-            if let Err(e) = guild_id
-                .set_commands(&ctx.http, commands.clone())
-                .await
-            {
+            if let Err(e) = guild_id.set_commands(&ctx.http, commands.clone()).await {
                 tracing::warn!(%guild_id, error = %e, "failed to register guild slash commands");
             } else {
                 info!(%guild_id, "registered guild slash commands");
@@ -686,10 +780,12 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd) if cmd.data.name == "models" => {
-                self.handle_config_command(&ctx, &cmd, "model", "model").await;
+                self.handle_config_command(&ctx, &cmd, "model", "model")
+                    .await;
             }
             Interaction::Command(cmd) if cmd.data.name == "agents" => {
-                self.handle_config_command(&ctx, &cmd, "agent", "agent").await;
+                self.handle_config_command(&ctx, &cmd, "agent", "agent")
+                    .await;
             }
             Interaction::Command(cmd) if cmd.data.name == "cancel" => {
                 self.handle_cancel_command(&ctx, &cmd).await;
@@ -708,19 +804,26 @@ impl EventHandler for Handler {
     }
 }
 
-
 // --- Slash command & interaction handlers ---
 
 impl Handler {
     /// Build a Discord select menu from ACP configOptions with the given category.
     /// Paginates options in pages of 25 (Discord limit). The current selection is
     /// always placed first so it appears on page 0.
-    fn build_config_select(options: &[ConfigOption], category: &str, page: usize) -> Option<CreateSelectMenu> {
-        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+    fn build_config_select(
+        options: &[ConfigOption],
+        category: &str,
+        page: usize,
+    ) -> Option<CreateSelectMenu> {
+        let opt = options
+            .iter()
+            .find(|o| o.category.as_deref() == Some(category))?;
 
         // Put current selection first so it always lands on page 0,
         // then fill remaining slots in original order.
-        let sorted: Vec<_> = opt.options.iter()
+        let sorted: Vec<_> = opt
+            .options
+            .iter()
             .filter(|o| o.value == opt.current_value)
             .chain(opt.options.iter().filter(|o| o.value != opt.current_value))
             .collect();
@@ -745,13 +848,20 @@ impl Handler {
             return None;
         }
 
-        let current_name = opt.options.iter()
+        let current_name = opt
+            .options
+            .iter()
             .find(|o| o.value == opt.current_value)
             .map(|o| o.name.as_str())
             .unwrap_or(&opt.current_value);
         let total_pages = sorted.len().div_ceil(SELECT_MENU_PAGE_SIZE);
         let placeholder = if total_pages > 1 {
-            format!("Current: {} (page {}/{})", current_name, page + 1, total_pages)
+            format!(
+                "Current: {} (page {}/{})",
+                current_name,
+                page + 1,
+                total_pages
+            )
         } else {
             format!("Current: {}", current_name)
         };
@@ -759,14 +869,20 @@ impl Handler {
         Some(
             CreateSelectMenu::new(
                 format!("acp_config_{}", opt.id),
-                CreateSelectMenuKind::String { options: menu_options },
+                CreateSelectMenuKind::String {
+                    options: menu_options,
+                },
             )
-            .placeholder(placeholder)
+            .placeholder(placeholder),
         )
     }
 
     /// Build ◀/▶ pagination buttons. Returns None when only one page exists.
-    fn build_pagination_buttons(category: &str, page: usize, total_pages: usize) -> Option<CreateActionRow> {
+    fn build_pagination_buttons(
+        category: &str,
+        page: usize,
+        total_pages: usize,
+    ) -> Option<CreateActionRow> {
         if total_pages <= 1 {
             return None;
         }
@@ -787,12 +903,20 @@ impl Handler {
 
     /// Build the full component rows (select menu + optional pagination) for a config category.
     /// When `page` is `None`, auto-selects the page containing the current value.
-    fn build_config_components(options: &[ConfigOption], category: &str, page: Option<usize>) -> Option<Vec<CreateActionRow>> {
-        let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+    fn build_config_components(
+        options: &[ConfigOption],
+        category: &str,
+        page: Option<usize>,
+    ) -> Option<Vec<CreateActionRow>> {
+        let opt = options
+            .iter()
+            .find(|o| o.category.as_deref() == Some(category))?;
         let total_pages = opt.options.len().div_ceil(SELECT_MENU_PAGE_SIZE);
         let page = match page {
             Some(p) => p.min(total_pages.saturating_sub(1)),
-            None => opt.options.iter()
+            None => opt
+                .options
+                .iter()
                 .position(|o| o.value == opt.current_value)
                 .map(|i| i / SELECT_MENU_PAGE_SIZE)
                 .unwrap_or(0),
@@ -849,7 +973,9 @@ impl Handler {
         };
 
         let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+            CreateInteractionResponseMessage::new()
+                .content(msg)
+                .ephemeral(true),
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel command");
@@ -866,11 +992,16 @@ impl Handler {
 
         let msg = match result {
             Ok(()) => "🔄 Session reset. Start a new conversation!".to_string(),
-            Err(_) => "⚠️ No active session to reset. Start a conversation first by @mentioning the bot.".to_string(),
+            Err(_) => {
+                "⚠️ No active session to reset. Start a conversation first by @mentioning the bot."
+                    .to_string()
+            }
         };
 
         let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+            CreateInteractionResponseMessage::new()
+                .content(msg)
+                .ephemeral(true),
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /reset command");
@@ -894,12 +1025,10 @@ impl Handler {
         }
 
         let selected_value = match &comp.data.kind {
-            ComponentInteractionDataKind::StringSelect { values } => {
-                match values.first() {
-                    Some(v) => v.clone(),
-                    None => return,
-                }
-            }
+            ComponentInteractionDataKind::StringSelect { values } => match values.first() {
+                Some(v) => v.clone(),
+                None => return,
+            },
             _ => return,
         };
 
@@ -928,7 +1057,9 @@ impl Handler {
         };
 
         let response = CreateInteractionResponse::UpdateMessage(
-            CreateInteractionResponseMessage::new().content(response_msg).components(vec![]),
+            CreateInteractionResponseMessage::new()
+                .content(response_msg)
+                .components(vec![]),
         );
 
         if let Err(e) = comp.create_response(&ctx.http, response).await {
@@ -1022,7 +1153,10 @@ async fn get_or_create_thread(
         origin_event_id: None,
     };
     let trigger_ref = discord_msg_ref(msg);
-    match adapter.create_thread(&parent, &trigger_ref, &thread_name).await {
+    match adapter
+        .create_thread(&parent, &trigger_ref, &thread_name)
+        .await
+    {
         Ok(ch) => Ok(ch),
         Err(e) if is_thread_already_exists_error(&e) => {
             // Another bot won the race from the same trigger message. Discord
@@ -1032,9 +1166,9 @@ async fn get_or_create_thread(
                 .channel_id
                 .message(&ctx.http, msg.id)
                 .await
-                .map_err(|fe| anyhow::anyhow!(
-                    "thread_already_exists (race), but refetch failed: {fe}"
-                ))?;
+                .map_err(|fe| {
+                    anyhow::anyhow!("thread_already_exists (race), but refetch failed: {fe}")
+                })?;
             let existing = refreshed.thread.ok_or_else(|| {
                 anyhow::anyhow!(
                     "thread_already_exists (race), but message has no thread after refetch"
@@ -1069,9 +1203,8 @@ fn is_thread_already_exists_error(err: &anyhow::Error) -> bool {
     msg.contains("160004") || msg.contains("already been created")
 }
 
-static ROLE_MENTION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"<@&\d+>").unwrap()
-});
+static ROLE_MENTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"<@&\d+>").unwrap());
 
 fn resolve_mentions(content: &str, bot_id: UserId) -> String {
     // 1. Strip the bot's own trigger mention
@@ -1156,7 +1289,12 @@ fn detect_thread(
 
 /// Returns `true` if the author should be denied by the user allowlist.
 /// Bot authors skip this check — they are gated by `allow_bot_messages` + `trusted_bot_ids`.
-fn is_denied_user(is_bot: bool, allow_all_users: bool, allowed_users: &HashSet<u64>, user_id: u64) -> bool {
+fn is_denied_user(
+    is_bot: bool,
+    allow_all_users: bool,
+    allowed_users: &HashSet<u64>,
+    user_id: u64,
+) -> bool {
     !is_bot && !allow_all_users && !allowed_users.contains(&user_id)
 }
 
@@ -1210,7 +1348,7 @@ fn should_process_user_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{HARD_BOT_TURN_LIMIT, TurnResult};
+    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT};
 
     // --- resolve_mentions tests ---
 
@@ -1296,10 +1434,10 @@ mod tests {
     fn multibot_mentions_single_bot_thread_no_mention() {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
-            false,          // is_mentioned
-            true,           // in_thread
-            true,           // involved
-            false,          // other_bot_present
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
         ));
     }
 
@@ -1311,10 +1449,10 @@ mod tests {
     fn multibot_mentions_multi_bot_thread_no_mention() {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
-            false,          // is_mentioned
-            true,           // in_thread
-            true,           // involved
-            true,           // other_bot_present ← another bot posted
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present ← another bot posted
         ));
     }
 
@@ -1325,10 +1463,10 @@ mod tests {
     fn multibot_mentions_multi_bot_thread_with_mention() {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
-            true,           // is_mentioned
-            true,           // in_thread
-            true,           // involved
-            true,           // other_bot_present
+            true, // is_mentioned
+            true, // in_thread
+            true, // involved
+            true, // other_bot_present
         ));
     }
 
@@ -1339,10 +1477,10 @@ mod tests {
     fn multibot_mentions_main_channel_no_mention() {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
-            false,          // is_mentioned
-            false,          // in_thread (main channel)
-            false,          // involved
-            false,          // other_bot_present
+            false, // is_mentioned
+            false, // in_thread (main channel)
+            false, // involved
+            false, // other_bot_present
         ));
     }
 
@@ -1353,10 +1491,10 @@ mod tests {
     fn multibot_mentions_not_involved() {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
-            false,          // is_mentioned
-            true,           // in_thread
-            false,          // involved ← bot hasn't posted here
-            false,          // other_bot_present
+            false, // is_mentioned
+            true,  // in_thread
+            false, // involved ← bot hasn't posted here
+            false, // other_bot_present
         ));
     }
 
@@ -1367,10 +1505,10 @@ mod tests {
     fn involved_mode_ignores_multibot() {
         assert!(should_process_user_message(
             AllowUsers::Involved,
-            false,          // is_mentioned
-            true,           // in_thread
-            true,           // involved
-            true,           // other_bot_present ← ignored in involved mode
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present ← ignored in involved mode
         ));
     }
 
@@ -1381,10 +1519,10 @@ mod tests {
     fn mentions_mode_always_requires_mention() {
         assert!(!should_process_user_message(
             AllowUsers::Mentions,
-            false,          // is_mentioned
-            true,           // in_thread
-            true,           // involved
-            false,          // other_bot_present
+            false, // is_mentioned
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
         ));
     }
 
@@ -1438,7 +1576,14 @@ mod tests {
     /// In-thread message: channel_id = parent, thread_id = thread channel ID.
     #[test]
     fn build_sender_context_in_thread() {
-        let ctx = build_sender_context("user1", "alice", "Alice", "thread_ch", Some("parent_ch"), false);
+        let ctx = build_sender_context(
+            "user1",
+            "alice",
+            "Alice",
+            "thread_ch",
+            Some("parent_ch"),
+            false,
+        );
         assert_eq!(ctx.channel_id, "parent_ch");
         assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
         assert_eq!(ctx.channel, "discord");
@@ -1624,8 +1769,12 @@ mod tests {
         let category_id: u64 = 200;
         let allowed = HashSet::from([category_id]);
         // Category child: has parent_id (the category) but NO thread_metadata.
-        let (in_thread, _) = detect_thread(false, Some(category_id), None, 1000, &allowed, false, false);
-        assert!(!in_thread, "category child must not match allowed_channels via parent_id");
+        let (in_thread, _) =
+            detect_thread(false, Some(category_id), None, 1000, &allowed, false, false);
+        assert!(
+            !in_thread,
+            "category child must not match allowed_channels via parent_id"
+        );
     }
 
     // --- Per-thread streaming tests (#534) ---
@@ -1745,10 +1894,10 @@ mod tests {
         // because is_mentioned=false and in_thread=false.
         assert!(!should_process_user_message(
             AllowUsers::Involved,
-            false,  // is_mentioned (DMs don't have @mention)
-            false,  // in_thread (DMs are not threads)
-            false,  // involved
-            false,  // other_bot_present
+            false, // is_mentioned (DMs don't have @mention)
+            false, // in_thread (DMs are not threads)
+            false, // involved
+            false, // other_bot_present
         ));
     }
 

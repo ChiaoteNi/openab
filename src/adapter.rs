@@ -1,11 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::error;
 
 use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
-use crate::config::{ReactionsConfig, ToolDisplay};
+use crate::config::{ReactionsConfig, ToolDisplay, UploadsConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
@@ -65,6 +66,11 @@ pub struct MessageRef {
     pub message_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct OutgoingAttachment {
+    pub path: PathBuf,
+}
+
 /// Sender identity injected into prompts for downstream agent context.
 ///
 /// This is **metadata for the agent** — `channel_id` always refers to the
@@ -101,6 +107,23 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
+
+    /// Send a new message with local file attachments. Default: unsupported.
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutgoingAttachment],
+    ) -> Result<MessageRef> {
+        if attachments.is_empty() {
+            self.send_message(channel, content).await
+        } else {
+            Err(anyhow::anyhow!(
+                "file uploads are not supported by the {} adapter",
+                self.platform()
+            ))
+        }
+    }
 
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
@@ -140,6 +163,7 @@ pub struct AdapterRouter {
     pool: Arc<SessionPool>,
     reactions_config: ReactionsConfig,
     table_mode: TableMode,
+    uploads_config: UploadsConfig,
 }
 
 impl AdapterRouter {
@@ -147,11 +171,13 @@ impl AdapterRouter {
         pool: Arc<SessionPool>,
         reactions_config: ReactionsConfig,
         table_mode: TableMode,
+        uploads_config: UploadsConfig,
     ) -> Self {
         Self {
             pool,
             reactions_config,
             table_mode,
+            uploads_config,
         }
     }
 
@@ -279,6 +305,7 @@ impl AdapterRouter {
         let streaming = adapter.use_streaming(other_bot_present);
         let table_mode = self.table_mode;
         let tool_display = self.reactions_config.tool_display;
+        let uploads_config = self.uploads_config.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -453,28 +480,223 @@ impl AdapterRouter {
                         final_content
                     };
 
+                    let (final_content, upload_paths) = extract_upload_directives(&final_content);
+                    let attachments = prepare_uploads(&uploads_config, upload_paths)?;
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = format::split_message(&final_content, message_limit);
-                    if let Some(msg) = placeholder_msg {
-                        // Streaming: edit first chunk into placeholder, send rest as new messages
-                        if let Some(first) = chunks.first() {
-                            let _ = adapter.edit_message(&msg, first).await;
-                        }
-                        for chunk in chunks.iter().skip(1) {
-                            let _ = adapter.send_message(&thread_channel, chunk).await;
-                        }
+                    let chunks = if final_content.trim().is_empty() {
+                        Vec::new()
                     } else {
-                        // Send-once: all chunks as new messages
-                        for chunk in &chunks {
-                            let _ = adapter.send_message(&thread_channel, chunk).await;
-                        }
-                    }
+                        format::split_message(&final_content, message_limit)
+                    };
+                    send_final_response(
+                        &adapter,
+                        &thread_channel,
+                        placeholder_msg,
+                        &chunks,
+                        &attachments,
+                    )
+                    .await?;
 
                     Ok(())
                 })
             })
             .await
     }
+}
+
+async fn send_final_response(
+    adapter: &Arc<dyn ChatAdapter>,
+    thread_channel: &ChannelRef,
+    placeholder_msg: Option<MessageRef>,
+    chunks: &[String],
+    attachments: &[OutgoingAttachment],
+) -> Result<()> {
+    if attachments.is_empty() {
+        if let Some(msg) = placeholder_msg {
+            if let Some(first) = chunks.first() {
+                let _ = adapter.edit_message(&msg, first).await;
+            }
+            for chunk in chunks.iter().skip(1) {
+                adapter.send_message(thread_channel, chunk).await?;
+            }
+        } else {
+            for chunk in chunks {
+                adapter.send_message(thread_channel, chunk).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(msg) = placeholder_msg {
+        if let Some(first) = chunks.first() {
+            let _ = adapter.edit_message(&msg, first).await;
+        } else {
+            let _ = adapter
+                .edit_message(&msg, &format!("Uploading {} file(s)...", attachments.len()))
+                .await;
+        }
+        for chunk in chunks.iter().skip(1) {
+            adapter.send_message(thread_channel, chunk).await?;
+        }
+        for batch in attachments.chunks(10) {
+            adapter
+                .send_message_with_attachments(thread_channel, "", batch)
+                .await?;
+        }
+        if chunks.is_empty() {
+            let _ = adapter
+                .edit_message(&msg, &format!("Uploaded {} file(s).", attachments.len()))
+                .await;
+        }
+        return Ok(());
+    }
+
+    let mut attachment_batches = attachments.chunks(10);
+    let first_batch = attachment_batches
+        .next()
+        .expect("attachments is non-empty when batching");
+    if let Some(first_chunk) = chunks.first() {
+        adapter
+            .send_message_with_attachments(thread_channel, first_chunk, first_batch)
+            .await?;
+        for chunk in chunks.iter().skip(1) {
+            adapter.send_message(thread_channel, chunk).await?;
+        }
+    } else {
+        adapter
+            .send_message_with_attachments(thread_channel, "", first_batch)
+            .await?;
+    }
+    for batch in attachment_batches {
+        adapter
+            .send_message_with_attachments(thread_channel, "", batch)
+            .await?;
+    }
+    Ok(())
+}
+
+fn extract_upload_directives(text: &str) -> (String, Vec<String>) {
+    let mut out = Vec::new();
+    let mut paths = Vec::new();
+    let mut in_upload_block = false;
+    let mut skip_blank_after_upload_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if skip_blank_after_upload_block {
+            skip_blank_after_upload_block = false;
+            if trimmed.is_empty() {
+                continue;
+            }
+        }
+        if !in_upload_block && is_upload_fence_start(trimmed) {
+            in_upload_block = true;
+            continue;
+        }
+        if in_upload_block {
+            if trimmed == "```" {
+                in_upload_block = false;
+                skip_blank_after_upload_block = true;
+                continue;
+            }
+            if let Some(path) = parse_upload_path_line(trimmed) {
+                paths.push(path);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+
+    (out.join("\n").trim().to_string(), paths)
+}
+
+fn is_upload_fence_start(line: &str) -> bool {
+    matches!(
+        line,
+        "```openab-upload" | "```openab-uploads" | "```openab-send-images"
+    )
+}
+
+fn parse_upload_path_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line.strip_prefix("- ").unwrap_or(line).trim();
+    Some(line.trim_matches('"').trim_matches('\'').to_string())
+}
+
+fn prepare_uploads(
+    config: &UploadsConfig,
+    raw_paths: Vec<String>,
+) -> Result<Vec<OutgoingAttachment>> {
+    if raw_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !config.enabled {
+        anyhow::bail!("agent requested file upload, but [uploads].enabled is false");
+    }
+    if raw_paths.len() > config.max_files {
+        anyhow::bail!(
+            "agent requested {} uploads, exceeding [uploads].max_files ({})",
+            raw_paths.len(),
+            config.max_files
+        );
+    }
+
+    let allowed_roots = canonical_allowed_roots(&config.allowed_roots)?;
+    let mut uploads = Vec::with_capacity(raw_paths.len());
+    for raw_path in raw_paths {
+        let path = PathBuf::from(&raw_path);
+        if !path.is_absolute() {
+            anyhow::bail!("upload path must be absolute: {raw_path}");
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("failed to resolve upload path {raw_path}: {e}"))?;
+        if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            anyhow::bail!(
+                "upload path {} is outside [uploads].allowed_roots",
+                canonical.display()
+            );
+        }
+        let metadata = std::fs::metadata(&canonical).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read upload metadata {}: {e}",
+                canonical.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!("upload path is not a file: {}", canonical.display());
+        }
+        if metadata.len() > config.max_file_bytes {
+            anyhow::bail!(
+                "upload file {} is {} bytes, exceeding [uploads].max_file_bytes ({})",
+                canonical.display(),
+                metadata.len(),
+                config.max_file_bytes
+            );
+        }
+        uploads.push(OutgoingAttachment { path: canonical });
+    }
+    Ok(uploads)
+}
+
+fn canonical_allowed_roots(raw_roots: &[String]) -> Result<Vec<PathBuf>> {
+    if raw_roots.is_empty() {
+        anyhow::bail!(
+            "[uploads].allowed_roots must contain at least one path when uploads are enabled"
+        );
+    }
+    raw_roots
+        .iter()
+        .map(|root| {
+            let path = Path::new(root);
+            path.canonicalize().map_err(|e| {
+                anyhow::anyhow!("failed to resolve upload root {}: {e}", path.display())
+            })
+        })
+        .collect()
 }
 
 /// Flatten a tool-call title into a single line safe for inline-code spans.
@@ -660,6 +882,53 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[test]
+    fn extract_upload_directives_strips_block_and_collects_paths() {
+        let input = r#"Here are the screenshots.
+
+```openab-upload
+# comment
+"/tmp/a.png"
+- /tmp/b with spaces.jpg
+```
+
+Done."#;
+        let (visible, paths) = extract_upload_directives(input);
+        assert_eq!(visible, "Here are the screenshots.\n\nDone.");
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/a.png".to_string(),
+                "/tmp/b with spaces.jpg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prepare_uploads_rejects_disabled_config() {
+        let err = prepare_uploads(&UploadsConfig::default(), vec!["/tmp/a.png".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[uploads].enabled is false"));
+    }
+
+    #[test]
+    fn prepare_uploads_accepts_file_under_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("a.png");
+        std::fs::write(&image, b"png").unwrap();
+        let config = UploadsConfig {
+            enabled: true,
+            allowed_roots: vec![dir.path().display().to_string()],
+            max_files: 10,
+            max_file_bytes: 1024,
+        };
+
+        let uploads = prepare_uploads(&config, vec![image.display().to_string()]).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].path.ends_with("a.png"));
     }
 
     #[test]
