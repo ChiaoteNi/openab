@@ -757,6 +757,7 @@ impl EventHandler for Handler {
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("sessions").description("List current agent sessions"),
         ];
 
         // Register global commands (works in DMs + all guilds after propagation).
@@ -792,6 +793,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "sessions" => {
+                self.handle_sessions_command(&ctx, &cmd).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -1005,6 +1009,95 @@ impl Handler {
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /reset command");
+        }
+    }
+
+    fn format_session_id(session_id: Option<&str>) -> String {
+        match session_id {
+            Some(id) if id.len() > 8 => format!("`{}...`", &id[..8]),
+            Some(id) => format!("`{id}`"),
+            None => "`unknown`".to_string(),
+        }
+    }
+
+    fn format_thread_ref(thread_id: &str) -> String {
+        match thread_id.strip_prefix("discord:") {
+            Some(id) => format!("<#{id}> (`{id}`)"),
+            None => format!("`{thread_id}`"),
+        }
+    }
+
+    fn format_idle_seconds(idle_seconds: Option<u64>) -> String {
+        match idle_seconds {
+            Some(seconds) if seconds < 60 => format!("{seconds}s idle"),
+            Some(seconds) if seconds < 3600 => format!("{}m idle", seconds / 60),
+            Some(seconds) => format!("{}h idle", seconds / 3600),
+            None => "in-flight".to_string(),
+        }
+    }
+
+    async fn handle_sessions_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let status = self.router.pool().status().await;
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "**Sessions** — active {}/{} · suspended {}",
+            status.active.len(),
+            status.max_sessions,
+            status.suspended.len()
+        ));
+
+        if status.active.is_empty() {
+            lines.push("Active: none".to_string());
+        } else {
+            lines.push("Active:".to_string());
+            for session in &status.active {
+                let state = if session.busy {
+                    "busy"
+                } else if session.alive == Some(false) {
+                    "dead"
+                } else {
+                    "idle"
+                };
+                lines.push(format!(
+                    "- {} — {} · {} · {}",
+                    Self::format_thread_ref(&session.thread_id),
+                    state,
+                    Self::format_idle_seconds(session.idle_seconds),
+                    Self::format_session_id(session.session_id.as_deref())
+                ));
+            }
+        }
+
+        if !status.suspended.is_empty() {
+            lines.push("Suspended:".to_string());
+            for session in status.suspended.iter().take(10) {
+                lines.push(format!(
+                    "- {} — {}",
+                    Self::format_thread_ref(&session.thread_id),
+                    Self::format_session_id(Some(&session.session_id))
+                ));
+            }
+            if status.suspended.len() > 10 {
+                lines.push(format!("- ... {} more", status.suspended.len() - 10));
+            }
+        }
+
+        lines.push(
+            "Use `/reset` inside a thread to close that thread's active session.".to_string(),
+        );
+        let msg = lines.join("\n");
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(msg)
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /sessions command");
         }
     }
 

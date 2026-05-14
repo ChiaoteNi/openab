@@ -10,6 +10,7 @@ OpenAB registers Discord slash commands for session control. These work in both 
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
+| `/sessions` | List current active and suspended sessions | No |
 
 All responses are **ephemeral** — only the user who invoked the command sees the reply.
 
@@ -62,6 +63,10 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
+
+### `/sessions`
+
+Shows the current session pool usage for this bot: active count, max capacity, suspended count, and the thread/session IDs for each active session. Busy sessions are in-flight and cannot be evicted until they finish or are reset.
 
 ## Passing CLI Commands via @mention
 

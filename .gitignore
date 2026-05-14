@@ -1,5 +1,6 @@
 /target
 config.toml
+config.codex.toml
 *.swp
 .DS_Store
 .env
