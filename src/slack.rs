@@ -777,6 +777,7 @@ pub async fn run_slack_adapter(
                                                         // DM: implicit mention — always process
                                                     } else {
                                                         match allow_user_messages {
+                                                            AllowUsers::All => {}
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }

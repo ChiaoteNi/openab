@@ -162,7 +162,8 @@ agents:
       allowBotMessages: "off"
       # trustedBotIds: Bot User IDs (U...) — find via Slack UI: click bot profile → Copy member ID
       trustedBotIds: []
-      # allowUserMessages: "involved" (default) | "mentions" | "multibot-mentions"
+      # allowUserMessages: "all" | "involved" (default) | "mentions" | "multibot-mentions"
+      # "all" = respond to every allowed user message without @mention
       # "involved" = respond to thread follow-ups without @mention if bot has participated
       # "mentions" = always require @mention
       # "multibot-mentions" = same as "involved" in single-bot threads; require @mention

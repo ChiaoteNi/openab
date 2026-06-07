@@ -529,6 +529,7 @@ impl EventHandler for Handler {
         }
 
         // User message gating (mirrors Slack's AllowUsers logic).
+        // All: process every allowed user message without @mention.
         // Mentions: always require @mention, even in bot's own threads.
         // Involved (default): skip @mention if the bot owns the thread
         //   (Option A) OR has previously posted in it (Option B).
@@ -537,6 +538,7 @@ impl EventHandler for Handler {
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_mentioned && !is_dm {
             match self.allow_user_messages {
+                AllowUsers::All => {}
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {
                     if !in_thread {
@@ -1427,6 +1429,7 @@ fn should_process_user_message(
         return true;
     }
     match mode {
+        AllowUsers::All => true,
         AllowUsers::Mentions => false,
         AllowUsers::Involved => in_thread && involved,
         AllowUsers::MultibotMentions => {
@@ -1574,6 +1577,34 @@ mod tests {
             false, // in_thread (main channel)
             false, // involved
             false, // other_bot_present
+        ));
+    }
+
+    /// GIVEN: all mode, not in a thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds after channel/user gates pass
+    #[test]
+    fn all_mode_main_channel_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::All,
+            false, // is_mentioned
+            false, // in_thread (main channel)
+            false, // involved
+            true,  // other_bot_present is ignored
+        ));
+    }
+
+    /// GIVEN: all mode, multi-bot thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds because all mode ignores participation/multibot gating
+    #[test]
+    fn all_mode_multi_bot_thread_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::All,
+            false, // is_mentioned
+            true,  // in_thread
+            false, // involved is ignored
+            true,  // other_bot_present is ignored
         ));
     }
 

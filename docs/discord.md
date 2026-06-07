@@ -69,7 +69,7 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 allowed_channels = ["123456789"]      # channel ID allowlist (empty = all)
 allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
-allow_user_messages = "involved"      # involved | mentions
+allow_user_messages = "involved"      # all | involved | mentions | multibot-mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
 ```
 
@@ -99,27 +99,29 @@ The bot's own messages are always ignored regardless of this setting.
 
 ### `allow_user_messages`
 
-Controls whether the bot requires @mention in threads.
+Controls whether the bot requires @mention for user messages.
 
 | Value | Behavior |
 |---|---|
+| `"all"` | Respond to every allowed user message without @mention. |
 | `"involved"` (default) | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
 | `"multibot-mentions"` | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
 
 #### Comparison
 
-| Scenario | `involved` | `mentions` | `multibot-mentions` |
-|---|---|---|---|
-| Main channel (no @mention) | ❌ | ❌ | ❌ |
-| Main channel (with @mention) | ✅ | ✅ | ✅ |
-| Single-bot thread (no @mention) | ✅ | ❌ | ✅ |
-| Single-bot thread (with @mention) | ✅ | ✅ | ✅ |
-| Multi-bot thread (no @mention) | ✅ | ❌ | ❌ |
-| Multi-bot thread (with @mention) | ✅ | ✅ | ✅ |
+| Scenario | `all` | `involved` | `mentions` | `multibot-mentions` |
+|---|---|---|---|---|
+| Main channel (no @mention) | ✅ | ❌ | ❌ | ❌ |
+| Main channel (with @mention) | ✅ | ✅ | ✅ | ✅ |
+| Single-bot thread (no @mention) | ✅ | ✅ | ❌ | ✅ |
+| Single-bot thread (with @mention) | ✅ | ✅ | ✅ | ✅ |
+| Multi-bot thread (no @mention) | ✅ | ✅ | ❌ | ❌ |
+| Multi-bot thread (with @mention) | ✅ | ✅ | ✅ | ✅ |
 
 #### When to use which
 
+- **`all`** — Dedicated or low-traffic channels where every allowed user message should trigger the bot.
 - **`involved`** — Single-bot setup, or you want all bots to respond freely in shared threads.
 - **`mentions`** — Strict control. Every message must explicitly @mention the bot. Best for high-traffic channels where accidental triggers are a concern.
 - **`multibot-mentions`** — Multi-bot setup. Natural conversation in single-bot threads, explicit @mention control in multi-bot threads. Recommended for most multi-bot deployments.
@@ -211,7 +213,7 @@ helm install openab openab/openab \
 
 ### Recommended: `multibot-mentions` mode
 
-In multi-bot channels, use `multibot-mentions` to get the best of both worlds:
+In multi-bot channels, use `multibot-mentions` to get the best of both worlds. Use `all` only if you want every bot in the allowed channel to respond to every user message:
 
 ```toml
 [discord]

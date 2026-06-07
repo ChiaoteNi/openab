@@ -135,8 +135,9 @@ fn default_max_bot_turns() -> u32 {
     20
 }
 
-/// Controls whether the bot responds to user messages in threads without @mention.
+/// Controls whether the bot responds to user messages without @mention.
 ///
+/// - `All`: respond to every allowed user message in allowed channels/threads.
 /// - `Involved` (default): respond to thread messages only if the bot has participated
 ///   in the thread (posted at least one message, or the thread parent @mentions the bot).
 ///   Channel/MPDM messages always require @mention. DMs always process (implicit mention).
@@ -149,18 +150,20 @@ pub enum AllowUsers {
     Involved,
     Mentions,
     MultibotMentions,
+    All,
 }
 
 impl<'de> Deserialize<'de> for AllowUsers {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.to_lowercase().replace('-', "_").as_str() {
+            "all" | "true" => Ok(Self::All),
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
             other => Err(serde::de::Error::unknown_variant(
                 other,
-                &["involved", "mentions", "multibot-mentions"],
+                &["all", "involved", "mentions", "multibot-mentions"],
             )),
         }
     }
@@ -576,6 +579,20 @@ command = "echo"
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
         assert!(!cfg.uploads.enabled);
+    }
+
+    #[test]
+    fn parse_discord_allow_user_messages_all() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+allow_user_messages = "all"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.discord.unwrap().allow_user_messages, AllowUsers::All);
     }
 
     #[test]

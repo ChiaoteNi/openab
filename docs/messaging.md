@@ -123,6 +123,7 @@ How involved bots behave on subsequent messages is controlled by `allow_user_mes
 
 | Mode | Behavior |
 |------|----------|
+| `all` | Every allowed user message triggers the bot, including main-channel messages without @mention. |
 | `involved` (default) | All involved bots respond to every message — no @mention required. |
 | `mentions` | Always require an explicit @mention, even in threads. |
 | `multibot-mentions` | Like `involved`, but once a second bot has posted in the thread, you must @mention the bot(s) you want to respond. |
@@ -145,7 +146,7 @@ User in thread: @BotA any other ideas?
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allow_user_messages` | string | `"involved"` | `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. `"multibot-mentions"` — require @mention once 2+ bots are in the thread. |
+| `allow_user_messages` | string | `"involved"` | `"all"` — reply to every allowed user message. `"involved"` — reply without @mention in participated threads. `"mentions"` — always require @mention. `"multibot-mentions"` — require @mention once 2+ bots are in the thread. |
 
 > **Note:** This is a **global setting** — it cannot be changed per thread. Configure it in `config.toml` or via `values.yaml` for Helm.
 
@@ -155,6 +156,7 @@ User in thread: @BotA any other ideas?
 [discord]
 bot_token = "${DISCORD_BOT_TOKEN}"
 # Default is "involved" — all involved bots respond without @mention.
+# Use "all" when every allowed user message should trigger the bot.
 # Use "multibot-mentions" for precise control in multi-bot threads.
 allow_user_messages = "multibot-mentions"
 ```
@@ -251,6 +253,7 @@ Layer 3 — Human → Multiple Bots (Thread)
     "involved"                  →  All involved bots respond
     "mentions"                  →  Only @mentioned bot responds
     "multibot-mentions"         →  Must @mention once 2+ bots are involved
+    "all"                       →  Every allowed user message triggers
 
 Layer 4 — Bot → Bot (Thread)
   Config: allow_bot_messages, trusted_bot_ids, max_bot_turns

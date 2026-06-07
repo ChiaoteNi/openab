@@ -66,6 +66,14 @@ tests:
           path: data["config.toml"]
           pattern: 'allow_user_messages = "involved"'
 
+  - it: renders allow_user_messages = "all"
+    set:
+      agents.kiro.discord.allowUserMessages: all
+    asserts:
+      - matchRegex:
+          path: data["config.toml"]
+          pattern: 'allow_user_messages = "all"'
+
   - it: renders allow_user_messages = "mentions"
     set:
       agents.kiro.discord.allowUserMessages: mentions
@@ -87,7 +95,7 @@ tests:
       agents.kiro.discord.allowUserMessages: yolo
     asserts:
       - failedTemplate:
-          errorPattern: "must be one of: involved, mentions, multibot-mentions"
+          errorPattern: "must be one of: all, involved, mentions, multibot-mentions"
 
   - it: renders slack allow_user_messages = "multibot-mentions"
     set:

@@ -11,7 +11,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_bot_messages = "off"  # "off" (default) | "mentions" | "all"
                                # "mentions" is recommended for multi-agent collaboration
 # trusted_bot_ids = []         # empty = any bot (mode permitting); set to restrict
-# allow_user_messages = "involved"  # "involved" (default) | "mentions"
+# allow_user_messages = "involved"  # "all" | "involved" (default) | "mentions"
+                                     # "all" = reply to every allowed user message
                                      # "involved" = reply in threads bot owns or has participated in
                                      # "mentions" = always require @mention
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
@@ -26,7 +27,8 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allowed_users = ["U0123456789"]      # only checked when allow_all_users = false
 # allow_bot_messages = "off"           # "off" (default) | "mentions" | "all"
 # trusted_bot_ids = []                 # empty = any bot (mode permitting); set to restrict
-# allow_user_messages = "involved"     # "involved" (default) | "mentions" | "multibot-mentions"
+# allow_user_messages = "involved"     # "all" | "involved" (default) | "mentions" | "multibot-mentions"
+                                        # "all" = reply to every allowed user message
                                         # "involved" = reply in threads bot has participated in
                                         # "mentions" = always require @mention
                                         # "multibot-mentions" = like "involved", but require @mention

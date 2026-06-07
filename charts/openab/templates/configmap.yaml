@@ -46,10 +46,10 @@ data:
     {{- end }}
     {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
     {{- if $cfg.discord.allowUserMessages }}
-    {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
-    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
+    {{- if not (has $cfg.discord.allowUserMessages (list "all" "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: all, involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name $cfg.discord.allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* all: respond to every allowed user message | involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
     {{- end }}
     {{- if hasKey $cfg.discord "allowDm" }}
     allow_dm = {{ $cfg.discord.allowDm }}
@@ -88,10 +88,10 @@ data:
     trusted_bot_ids = {{ ($cfg.slack).trustedBotIds | toJson }}
     {{- end }}
     {{- if ($cfg.slack).allowUserMessages }}
-    {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions" "multibot-mentions")) }}
-    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
+    {{- if not (has ($cfg.slack).allowUserMessages (list "all" "involved" "mentions" "multibot-mentions")) }}
+    {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: all, involved, mentions, multibot-mentions (use hyphen form, not underscore) — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* all: respond to every allowed user message | involved (default): respond in bot's threads without @mention | mentions: always require @mention | multibot-mentions: require @mention only when another bot has posted in the thread */ -}}
     {{- end }}
     {{- /* maxBotTurns: soft cap on consecutive bot turns per thread (human msg resets the counter) */ -}}
     {{- if hasKey ($cfg.slack | default dict) "maxBotTurns" }}
