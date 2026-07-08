@@ -594,6 +594,7 @@ impl EventHandler for Handler {
         }
 
         let prompt = resolve_mentions(&msg.content, bot_id);
+        let has_text_prompt = !prompt.is_empty();
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -616,6 +617,7 @@ impl EventHandler for Handler {
 
         // Build extra content blocks from attachments (audio → STT, text → inline, image → encode)
         let mut extra_blocks = Vec::new();
+        let mut has_voice_transcript = false;
         let mut text_file_bytes: u64 = 0;
         let mut text_file_count: u32 = 0;
         const TEXT_TOTAL_CAP: u64 = 1024 * 1024; // 1 MB total for all text file attachments
@@ -637,6 +639,7 @@ impl EventHandler for Handler {
                     .await
                     {
                         debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                        has_voice_transcript = true;
                         extra_blocks.insert(
                             0,
                             ContentBlock::Text {
@@ -726,6 +729,7 @@ impl EventHandler for Handler {
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
         let mut sender = sender;
+        sender.input_source = input_source(has_text_prompt, has_voice_transcript).to_string();
         if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
@@ -1340,8 +1344,17 @@ fn build_sender_context(
         display_name: display_name.to_string(),
         channel: "discord".into(),
         channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
+        input_source: "text".into(),
         thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
         is_bot,
+    }
+}
+
+fn input_source(has_text_prompt: bool, has_voice_transcript: bool) -> &'static str {
+    match (has_text_prompt, has_voice_transcript) {
+        (true, true) => "mixed",
+        (false, true) => "voice_transcript",
+        _ => "text",
     }
 }
 
@@ -1712,6 +1725,7 @@ mod tests {
         assert_eq!(ctx.thread_id, Some("thread_ch".to_string()));
         assert_eq!(ctx.channel, "discord");
         assert_eq!(ctx.sender_id, "user1");
+        assert_eq!(ctx.input_source, "text");
         assert!(!ctx.is_bot);
     }
 
@@ -1721,6 +1735,7 @@ mod tests {
         let ctx = build_sender_context("user1", "alice", "Alice", "main_ch", None, false);
         assert_eq!(ctx.channel_id, "main_ch");
         assert_eq!(ctx.thread_id, None);
+        assert_eq!(ctx.input_source, "text");
     }
 
     /// Bot sender: is_bot flag propagated correctly.
@@ -1730,6 +1745,14 @@ mod tests {
         assert!(ctx.is_bot);
         assert_eq!(ctx.channel_id, "parent");
         assert_eq!(ctx.thread_id, Some("ch".to_string()));
+    }
+
+    #[test]
+    fn input_source_classifies_text_voice_and_mixed() {
+        assert_eq!(input_source(true, false), "text");
+        assert_eq!(input_source(false, true), "voice_transcript");
+        assert_eq!(input_source(true, true), "mixed");
+        assert_eq!(input_source(false, false), "text");
     }
 
     // --- detect_thread tests (regression for #506 → #518 → #519) ---

@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -70,7 +70,11 @@ pub struct SlackAdapter {
 }
 
 impl SlackAdapter {
-    pub fn new(bot_token: String, session_ttl: std::time::Duration, _allow_bot_messages: AllowBots) -> Self {
+    pub fn new(
+        bot_token: String,
+        session_ttl: std::time::Duration,
+        _allow_bot_messages: AllowBots,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             bot_token,
@@ -93,20 +97,28 @@ impl SlackAdapter {
     /// depend on fetching thread history. Idempotent.
     async fn note_other_bot_in_thread(&self, thread_ts: &str) {
         let mut cache = self.multibot_threads.lock().await;
-        cache.entry(thread_ts.to_string()).or_insert_with(tokio::time::Instant::now);
+        cache
+            .entry(thread_ts.to_string())
+            .or_insert_with(tokio::time::Instant::now);
         enforce_cache_bounds(&mut cache, self.session_ttl);
     }
 
     /// Get the bot's own Slack user ID (cached after first call).
     async fn get_bot_user_id(&self) -> Option<&str> {
-        self.bot_user_id.get_or_try_init(|| async {
-            let resp = self.api_post("auth.test", serde_json::json!({})).await
-                .map_err(|e| anyhow!("auth.test failed: {e}"))?;
-            resp["user_id"]
-                .as_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| anyhow!("no user_id in auth.test response"))
-        }).await.ok().map(|s| s.as_str())
+        self.bot_user_id
+            .get_or_try_init(|| async {
+                let resp = self
+                    .api_post("auth.test", serde_json::json!({}))
+                    .await
+                    .map_err(|e| anyhow!("auth.test failed: {e}"))?;
+                resp["user_id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| anyhow!("no user_id in auth.test response"))
+            })
+            .await
+            .ok()
+            .map(|s| s.as_str())
     }
 
     async fn api_post(&self, method: &str, body: serde_json::Value) -> Result<serde_json::Value> {
@@ -160,10 +172,7 @@ impl SlackAdapter {
         }
 
         let resp = self
-            .api_post(
-                "users.info",
-                serde_json::json!({ "user": user_id }),
-            )
+            .api_post("users.info", serde_json::json!({ "user": user_id }))
             .await
             .ok()?;
         let user = resp.get("user")?;
@@ -176,9 +185,7 @@ impl SlackAdapter {
             .get("real_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty());
-        let name = user
-            .get("name")
-            .and_then(|v| v.as_str());
+        let name = user.get("name").and_then(|v| v.as_str());
         let resolved = display.or(real).or(name)?.to_string();
 
         // Cache the result
@@ -204,15 +211,12 @@ impl SlackAdapter {
             .api_post("bots.info", serde_json::json!({ "bot": bot_id }))
             .await
             .ok()?;
-        let user_id = resp.get("bot")?
-            .get("user_id")?
-            .as_str()?
-            .to_string();
+        let user_id = resp.get("bot")?.get("user_id")?.as_str()?.to_string();
 
-        self.bot_id_cache.lock().await.insert(
-            bot_id.to_string(),
-            user_id.clone(),
-        );
+        self.bot_id_cache
+            .lock()
+            .await
+            .insert(bot_id.to_string(), user_id.clone());
 
         Some(user_id)
     }
@@ -226,11 +230,15 @@ impl SlackAdapter {
     async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> (bool, bool) {
         let cached_involved = {
             let cache = self.participated_threads.lock().await;
-            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            cache
+                .get(thread_ts)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
         };
         let cached_multibot = {
             let cache = self.multibot_threads.lock().await;
-            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+            cache
+                .get(thread_ts)
+                .is_some_and(|ts| ts.elapsed() < self.session_ttl)
         };
 
         // Eager multibot detection from message events populates the cache
@@ -266,7 +274,9 @@ impl SlackAdapter {
                 return (false, false);
             }
         };
-        let Some(messages) = json["messages"].as_array() else { return (false, false) };
+        let Some(messages) = json["messages"].as_array() else {
+            return (false, false);
+        };
 
         let parent_mentions_bot = messages
             .first()
@@ -278,8 +288,8 @@ impl SlackAdapter {
         let involved = parent_mentions_bot || bot_posted;
         let other_bot_present = cached_multibot
             || messages.iter().any(|m| {
-                let is_bot_msg = m["bot_id"].is_string()
-                    || m["subtype"].as_str() == Some("bot_message");
+                let is_bot_msg =
+                    m["bot_id"].is_string() || m["subtype"].as_str() == Some("bot_message");
                 is_bot_msg && m["user"].as_str() != Some(bot_id)
             });
 
@@ -356,7 +366,6 @@ impl ChatAdapter for SlackAdapter {
         })
     }
 
-
     async fn create_thread(
         &self,
         channel: &ChannelRef,
@@ -375,15 +384,16 @@ impl ChatAdapter for SlackAdapter {
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
         let name = unicode_to_slack_emoji(emoji);
-        match self.api_post(
-            "reactions.add",
-            serde_json::json!({
-                "channel": msg.channel.channel_id,
-                "timestamp": msg.message_id,
-                "name": name,
-            }),
-        )
-        .await
+        match self
+            .api_post(
+                "reactions.add",
+                serde_json::json!({
+                    "channel": msg.channel.channel_id,
+                    "timestamp": msg.message_id,
+                    "name": name,
+                }),
+            )
+            .await
         {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("already_reacted") => Ok(()),
@@ -393,15 +403,16 @@ impl ChatAdapter for SlackAdapter {
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
         let name = unicode_to_slack_emoji(emoji);
-        match self.api_post(
-            "reactions.remove",
-            serde_json::json!({
-                "channel": msg.channel.channel_id,
-                "timestamp": msg.message_id,
-                "name": name,
-            }),
-        )
-        .await
+        match self
+            .api_post(
+                "reactions.remove",
+                serde_json::json!({
+                    "channel": msg.channel.channel_id,
+                    "timestamp": msg.message_id,
+                    "name": name,
+                }),
+            )
+            .await
         {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("no_reaction") => Ok(()),
@@ -934,8 +945,8 @@ async fn handle_message(
         Some(u) => u.to_string(),
         None => return,
     };
-    let is_bot_msg = event["bot_id"].is_string()
-        || event["subtype"].as_str() == Some("bot_message");
+    let is_bot_msg =
+        event["bot_id"].is_string() || event["subtype"].as_str() == Some("bot_message");
     let text = match event["text"].as_str() {
         Some(t) => t.to_string(),
         None => return,
@@ -972,6 +983,7 @@ async fn handle_message(
     // can still @-mention other users in its reply.
     let bot_id = adapter.get_bot_user_id().await;
     let prompt = resolve_slack_mentions(&text, bot_id);
+    let has_text_prompt = !prompt.is_empty();
 
     // Process file attachments (images, audio)
     let files = event["files"].as_array();
@@ -987,6 +999,7 @@ async fn handle_message(
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
+    let mut has_voice_transcript = false;
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
 
@@ -1012,11 +1025,21 @@ async fn handle_message(
                         size,
                         stt_config,
                         Some(bot_token),
-                    ).await {
-                        debug!(filename, chars = transcript.len(), "voice transcript injected");
-                        extra_blocks.insert(0, ContentBlock::Text {
-                            text: format!("[Voice message transcript]: {transcript}"),
-                        });
+                    )
+                    .await
+                    {
+                        debug!(
+                            filename,
+                            chars = transcript.len(),
+                            "voice transcript injected"
+                        );
+                        has_voice_transcript = true;
+                        extra_blocks.insert(
+                            0,
+                            ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            },
+                        );
                     }
                 } else {
                     debug!(filename, "skipping audio attachment (STT disabled)");
@@ -1034,7 +1057,11 @@ async fn handle_message(
                 }
             } else if media::is_text_file(filename, Some(mimetype)) {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
-                    debug!(filename, count = text_file_count, "text file count cap reached, skipping");
+                    debug!(
+                        filename,
+                        count = text_file_count,
+                        "text file count cap reached, skipping"
+                    );
                     continue;
                 }
                 // Pre-check with Slack-reported size as a fast path when the
@@ -1043,15 +1070,16 @@ async fn handle_message(
                 // authoritative cap check happens after download using
                 // `actual_bytes`.
                 if size > 0 && text_file_bytes + size > TEXT_TOTAL_CAP {
-                    debug!(filename, total = text_file_bytes, "text attachments total exceeds 1MB cap, skipping remaining");
+                    debug!(
+                        filename,
+                        total = text_file_bytes,
+                        "text attachments total exceeds 1MB cap, skipping remaining"
+                    );
                     continue;
                 }
-                if let Some((block, actual_bytes)) = media::download_and_read_text_file(
-                    url,
-                    filename,
-                    size,
-                    Some(bot_token),
-                ).await {
+                if let Some((block, actual_bytes)) =
+                    media::download_and_read_text_file(url, filename, size, Some(bot_token)).await
+                {
                     if text_file_bytes + actual_bytes > TEXT_TOTAL_CAP {
                         debug!(
                             filename,
@@ -1072,7 +1100,9 @@ async fn handle_message(
                 filename,
                 size,
                 Some(bot_token),
-            ).await {
+            )
+            .await
+            {
                 debug!(filename, "adding image attachment");
                 extra_blocks.push(block);
             }
@@ -1092,6 +1122,7 @@ async fn handle_message(
         display_name,
         channel: "slack".into(),
         channel_id: channel_id.clone(),
+        input_source: input_source(has_text_prompt, has_voice_transcript).into(),
         thread_id: thread_ts.clone(),
         is_bot: is_bot_msg,
     };
@@ -1131,14 +1162,33 @@ async fn handle_message(
     let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
     let other_bot_present = {
         let cache = adapter.multibot_threads.lock().await;
-        thread_channel.thread_id.as_deref()
-            .is_some_and(|ts| cache.get(ts).is_some_and(|inst| inst.elapsed() < adapter.session_ttl))
+        thread_channel.thread_id.as_deref().is_some_and(|ts| {
+            cache
+                .get(ts)
+                .is_some_and(|inst| inst.elapsed() < adapter.session_ttl)
+        })
     };
     if let Err(e) = router
-        .handle_message(&adapter_dyn, &thread_channel, &sender_json, &prompt, extra_blocks, &trigger_msg, other_bot_present)
+        .handle_message(
+            &adapter_dyn,
+            &thread_channel,
+            &sender_json,
+            &prompt,
+            extra_blocks,
+            &trigger_msg,
+            other_bot_present,
+        )
         .await
     {
         error!("Slack handle_message error: {e}");
+    }
+}
+
+fn input_source(has_text_prompt: bool, has_voice_transcript: bool) -> &'static str {
+    match (has_text_prompt, has_voice_transcript) {
+        (true, true) => "mixed",
+        (false, true) => "voice_transcript",
+        _ => "text",
     }
 }
 
@@ -1207,12 +1257,12 @@ fn markdown_to_mrkdwn(text: &str) -> String {
         LazyLock::new(|| regex::Regex::new(r"```\w+\n").unwrap());
 
     // Order: bold first (** → placeholder), then italic (* → _), then restore bold
-    let text = BOLD_RE.replace_all(text, "\x01$1\x02");       // **bold** → \x01bold\x02
-    let text = ITALIC_RE.replace_all(&text, "_${1}_");         // *italic* → _italic_
-    // Restore bold: \x01bold\x02 → *bold*
+    let text = BOLD_RE.replace_all(text, "\x01$1\x02"); // **bold** → \x01bold\x02
+    let text = ITALIC_RE.replace_all(&text, "_${1}_"); // *italic* → _italic_
+                                                       // Restore bold: \x01bold\x02 → *bold*
     let text = text.replace(['\x01', '\x02'], "*");
-    let text = LINK_RE.replace_all(&text, "<$2|$1>");          // [text](url) → <url|text>
-    let text = HEADING_RE.replace_all(&text, "*$1*");          // # heading → *heading*
+    let text = LINK_RE.replace_all(&text, "<$2|$1>"); // [text](url) → <url|text>
+    let text = HEADING_RE.replace_all(&text, "*$1*"); // # heading → *heading*
     let text = CODE_BLOCK_LANG_RE.replace_all(&text, "```\n"); // ```rust → ```
     text.into_owned()
 }
@@ -1369,7 +1419,13 @@ mod tests {
         let ttl = std::time::Duration::from_secs(300);
         let adapter = SlackAdapter::new("xoxb-test".into(), ttl, AllowBots::Mentions);
 
-        assert!(adapter.use_streaming(false), "should stream when no other bot");
-        assert!(!adapter.use_streaming(true), "should NOT stream when other bot present");
+        assert!(
+            adapter.use_streaming(false),
+            "should stream when no other bot"
+        );
+        assert!(
+            !adapter.use_streaming(true),
+            "should NOT stream when other bot present"
+        );
     }
 }

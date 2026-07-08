@@ -37,10 +37,19 @@ Discord voice message (.ogg)
   "[Voice message transcript]: <transcribed text>"
        │
        ▼
-  ACP agent receives plain text
+  sender_context.input_source marks voice_transcript or mixed
+       │
+       ▼
+  ACP agent receives text plus source metadata
 ```
 
-The transcript is prepended to the prompt as a `ContentBlock::Text`, so the downstream agent (Kiro CLI, Claude Code, etc.) sees it as regular text input.
+The transcript is prepended to the prompt as a `ContentBlock::Text`, so the downstream agent (Kiro CLI, Claude Code, etc.) sees it as regular text input. OpenAB also sets `sender_context.input_source` so the agent can distinguish typed text from STT-derived input:
+
+| Value | Meaning |
+|---|---|
+| `text` | Typed text, or no successful STT transcript |
+| `voice_transcript` | Audio-only input successfully transcribed by STT |
+| `mixed` | Typed text plus a successful STT transcript |
 
 ## Configuration Reference
 

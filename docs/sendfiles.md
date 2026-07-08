@@ -64,7 +64,8 @@ Every message includes a `<sender_context>` JSON block:
   "schema": "openab.sender.v1",
   "channel": "discord",
   "channel_id": "1490282656913559673",
-  "thread_id": "1499442140172910654"
+  "thread_id": "1499442140172910654",
+  "input_source": "text"
 }
 ```
 

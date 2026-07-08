@@ -93,12 +93,16 @@ struct GatewayResponse {
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
-type SharedWsTx = Arc<Mutex<futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+type SharedWsTx = Arc<
+    Mutex<
+        futures_util::stream::SplitSink<
+            tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            Message,
+        >,
     >,
-    Message,
->>>;
+>;
 
 pub struct GatewayAdapter {
     ws_tx: SharedWsTx,
@@ -404,8 +408,12 @@ pub async fn run_gateway_adapter(
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx: SharedWsTx = Arc::new(Mutex::new(ws_tx));
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
-        let adapter: Arc<dyn ChatAdapter> =
-            Arc::new(GatewayAdapter::new(ws_tx.clone(), pending.clone(), platform, streaming));
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(GatewayAdapter::new(
+            ws_tx.clone(),
+            pending.clone(),
+            platform,
+            streaming,
+        ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
@@ -485,6 +493,7 @@ pub async fn run_gateway_adapter(
                                         display_name: event.sender.display_name.clone(),
                                         channel: event.channel.channel_type.clone(),
                                         channel_id: event.channel.id.clone(),
+                                        input_source: "text".into(),
                                         thread_id: event.channel.thread_id.clone(),
                                         is_bot: event.sender.is_bot,
                                     };

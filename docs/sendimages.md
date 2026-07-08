@@ -48,6 +48,7 @@ Every message from OpenAB includes a `<sender_context>` JSON block:
   "channel": "discord",
   "channel_id": "1490282656913559673",
   "thread_id": "1499442140172910654",
+  "input_source": "text",
   "is_bot": false
 }
 ```

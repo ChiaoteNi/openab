@@ -12,6 +12,14 @@ use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
 
+const VOICE_TRANSCRIPT_PREFIX: &str = "[Voice message transcript]:";
+const STT_CONFIRMATION_GATE: &str = "\
+[OpenAB STT confirmation gate]
+This inbound user message contains a voice-message transcript. Before doing any requested work:
+1. Reply in Traditional Chinese with a concise bullet list of what you understand the user wants.
+2. Ask the user to confirm or correct that interpretation.
+3. Do not run tools, dispatch agents, edit files, or perform external side effects until the user confirms.";
+
 // --- Platform-agnostic types ---
 
 /// Identifies a channel or thread across platforms.
@@ -88,6 +96,13 @@ pub struct SenderContext {
     pub display_name: String,
     pub channel: String,
     pub channel_id: String,
+    /// Origin of the user-visible input delivered to the agent.
+    ///
+    /// Chat adapters use:
+    /// - `text`: typed text, or no successful STT transcript
+    /// - `voice_transcript`: audio-only input transcribed by STT
+    /// - `mixed`: typed text plus a successful STT transcript
+    pub input_source: String,
     /// Thread identifier, if the message is inside a thread.
     /// Slack: thread_ts. Discord: thread channel ID (channel_id holds the parent).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,22 +223,7 @@ impl AdapterRouter {
             sender_json, prompt
         );
 
-        let mut content_blocks = Vec::with_capacity(1 + extra_blocks.len());
-        // Prepend any transcript blocks (they go before the text block)
-        for block in &extra_blocks {
-            if matches!(block, ContentBlock::Text { .. }) {
-                content_blocks.push(block.clone());
-            }
-        }
-        content_blocks.push(ContentBlock::Text {
-            text: prompt_with_sender,
-        });
-        // Append non-text blocks (images)
-        for block in extra_blocks {
-            if !matches!(block, ContentBlock::Text { .. }) {
-                content_blocks.push(block);
-            }
-        }
+        let content_blocks = build_content_blocks(prompt_with_sender, extra_blocks);
 
         let thread_key = format!(
             "{}:{}",
@@ -502,6 +502,47 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+fn build_content_blocks(
+    prompt_with_sender: String,
+    extra_blocks: Vec<ContentBlock>,
+) -> Vec<ContentBlock> {
+    let has_voice_transcript = extra_blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::Text { text } if text.starts_with(VOICE_TRANSCRIPT_PREFIX)
+        )
+    });
+
+    let mut content_blocks =
+        Vec::with_capacity(1 + extra_blocks.len() + usize::from(has_voice_transcript));
+
+    if has_voice_transcript {
+        content_blocks.push(ContentBlock::Text {
+            text: STT_CONFIRMATION_GATE.to_string(),
+        });
+    }
+
+    // Prepend any transcript/text blocks (they go before the sender context block).
+    for block in &extra_blocks {
+        if matches!(block, ContentBlock::Text { .. }) {
+            content_blocks.push(block.clone());
+        }
+    }
+
+    content_blocks.push(ContentBlock::Text {
+        text: prompt_with_sender,
+    });
+
+    // Append non-text blocks (images).
+    for block in extra_blocks {
+        if !matches!(block, ContentBlock::Text { .. }) {
+            content_blocks.push(block);
+        }
+    }
+
+    content_blocks
 }
 
 async fn send_final_response(
@@ -882,6 +923,42 @@ mod tests {
         let adapter = TestAdapter;
         // Verify the method is callable and returns the declared value
         assert!(!adapter.use_streaming(false));
+    }
+
+    #[test]
+    fn stt_transcript_blocks_are_prefixed_with_confirmation_gate() {
+        let blocks = build_content_blocks(
+            "<sender_context>{}</sender_context>".into(),
+            vec![ContentBlock::Text {
+                text: "[Voice message transcript]: 幫我看目前狀態".into(),
+            }],
+        );
+
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text.contains("STT confirmation gate")),
+            "expected first block to be the STT gate: {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text { text } if text.starts_with("[Voice message transcript]:")),
+            "expected second block to preserve transcript: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_blocks_do_not_trigger_stt_confirmation_gate() {
+        let blocks = build_content_blocks(
+            "<sender_context>{}</sender_context>".into(),
+            vec![ContentBlock::Text {
+                text: "[Attached text file: notes.txt]\nhello".into(),
+            }],
+        );
+
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if !text.contains("STT confirmation gate")),
+            "ordinary text attachment should not trigger STT gate: {blocks:?}"
+        );
     }
 
     #[test]
