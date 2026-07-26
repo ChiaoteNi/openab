@@ -1,6 +1,9 @@
 /target
 gateway/target/
+agy-acp/target/
 config.toml
+config.codex.toml
+config.agy.toml
 *.swp
 .DS_Store
 .env

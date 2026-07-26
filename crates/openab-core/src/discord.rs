@@ -1,6 +1,9 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    classify_input_source, AdapterRouter, ChannelRef, ChatAdapter, MessageRef, OutgoingAttachment,
+    SenderContext,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
@@ -12,7 +15,7 @@ use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
     CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
     CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, GetMessages,
 };
 use serenity::http::Http;
@@ -95,6 +98,37 @@ impl ChatAdapter for DiscordAdapter {
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
+    }
+
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutgoingAttachment],
+    ) -> anyhow::Result<MessageRef> {
+        if attachments.is_empty() {
+            return self.send_message(channel, content).await;
+        }
+        if attachments.len() > 10 {
+            anyhow::bail!("Discord supports at most 10 attachments per message");
+        }
+
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let mut files = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            files.push(CreateAttachment::path(&attachment.path).await?);
+        }
+        let mut builder = CreateMessage::new().files(files);
+        if !content.is_empty() {
+            builder = builder.content(content);
+        }
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -782,6 +816,7 @@ impl EventHandler for Handler {
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_mentioned && !is_dm {
             match self.allow_user_messages {
+                AllowUsers::All => {}
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {
                     if !in_thread {
@@ -837,6 +872,7 @@ impl EventHandler for Handler {
         }
 
         let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        let has_text_prompt = !prompt.is_empty();
 
         // No text and no attachments → skip
         if prompt.is_empty() && msg.attachments.is_empty() {
@@ -864,6 +900,7 @@ impl EventHandler for Handler {
         // Build extra content blocks from attachments (audio -> STT, text -> inline,
         // image -> encode, video -> URL for agent-side inspection).
         let mut extra_blocks = Vec::new();
+        let mut has_voice_transcript = false;
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
         let mut text_file_bytes: u64 = 0;
@@ -888,6 +925,7 @@ impl EventHandler for Handler {
                     {
                         Some(transcript) => {
                             debug!(filename = %attachment.filename, chars = transcript.len(), "voice transcript injected");
+                            has_voice_transcript = true;
                             extra_blocks.insert(
                                 0,
                                 ContentBlock::Text {
@@ -1073,6 +1111,8 @@ impl EventHandler for Handler {
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
         let mut sender = sender;
+        sender.input_source =
+            classify_input_source(has_text_prompt, has_voice_transcript).to_string();
         if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
@@ -1399,6 +1439,7 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("sessions").description("List current agent sessions"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
                 .add_option(CreateCommandOption::new(
@@ -1501,6 +1542,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "sessions" => {
+                self.handle_sessions_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "remind" => {
                 self.handle_remind_command(&ctx, &cmd).await;
@@ -1783,6 +1827,95 @@ impl Handler {
         );
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel-all command");
+        }
+    }
+
+    fn format_session_id(session_id: Option<&str>) -> String {
+        match session_id {
+            Some(id) if id.len() > 8 => format!("`{}...`", &id[..8]),
+            Some(id) => format!("`{id}`"),
+            None => "`unknown`".to_string(),
+        }
+    }
+
+    fn format_thread_ref(thread_id: &str) -> String {
+        match thread_id.strip_prefix("discord:") {
+            Some(id) => format!("<#{id}> (`{id}`)"),
+            None => format!("`{thread_id}`"),
+        }
+    }
+
+    fn format_idle_seconds(idle_seconds: Option<u64>) -> String {
+        match idle_seconds {
+            Some(seconds) if seconds < 60 => format!("{seconds}s idle"),
+            Some(seconds) if seconds < 3600 => format!("{}m idle", seconds / 60),
+            Some(seconds) => format!("{}h idle", seconds / 3600),
+            None => "in-flight".to_string(),
+        }
+    }
+
+    async fn handle_sessions_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let status = self.router.pool().status().await;
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "**Sessions** — active {}/{} · suspended {}",
+            status.active.len(),
+            status.max_sessions,
+            status.suspended.len()
+        ));
+
+        if status.active.is_empty() {
+            lines.push("Active: none".to_string());
+        } else {
+            lines.push("Active:".to_string());
+            for session in &status.active {
+                let state = if session.busy {
+                    "busy"
+                } else if session.alive == Some(false) {
+                    "dead"
+                } else {
+                    "idle"
+                };
+                lines.push(format!(
+                    "- {} — {} · {} · {}",
+                    Self::format_thread_ref(&session.thread_id),
+                    state,
+                    Self::format_idle_seconds(session.idle_seconds),
+                    Self::format_session_id(session.session_id.as_deref())
+                ));
+            }
+        }
+
+        if !status.suspended.is_empty() {
+            lines.push("Suspended:".to_string());
+            for session in status.suspended.iter().take(10) {
+                lines.push(format!(
+                    "- {} — {}",
+                    Self::format_thread_ref(&session.thread_id),
+                    Self::format_session_id(Some(&session.session_id))
+                ));
+            }
+            if status.suspended.len() > 10 {
+                lines.push(format!("- ... {} more", status.suspended.len() - 10));
+            }
+        }
+
+        lines.push(
+            "Use `/reset` inside a thread to close that thread's active session.".to_string(),
+        );
+        let msg = lines.join("\n");
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(msg)
+                .ephemeral(true),
+        );
+        if let Err(e) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(error = %e, "failed to respond to /sessions command");
         }
     }
 
@@ -3055,6 +3188,7 @@ fn build_sender_context(
         display_name: display_name.to_string(),
         channel: "discord".into(),
         channel_id: thread_parent_id.unwrap_or(msg_channel_id).to_string(),
+        input_source: "text".into(),
         thread_id: thread_parent_id.map(|_| msg_channel_id.to_string()),
         is_bot,
         timestamp: Some(timestamp.to_string()),
@@ -3159,6 +3293,7 @@ fn should_process_user_message(
         return true;
     }
     match mode {
+        AllowUsers::All => true,
         AllowUsers::Mentions => false,
         AllowUsers::Involved => in_thread && involved,
         AllowUsers::MultibotMentions => {
@@ -3189,6 +3324,7 @@ fn should_process_reaction(
     targets_this_bot: bool,
 ) -> bool {
     match mode {
+        AllowUsers::All => true,
         AllowUsers::Mentions => false,
         AllowUsers::Involved => is_thread && bot_involved,
         AllowUsers::MultibotMentions => {
@@ -3803,6 +3939,34 @@ mod tests {
     // The bug in #481 was that other bots' messages were filtered by bot gating
     // before multibot detection could run, so the bot never learned the thread
     // was multi-bot and responded without @mention.
+
+    /// GIVEN: all mode, not in a thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds after channel/user gates pass
+    #[test]
+    fn all_mode_main_channel_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::All,
+            false, // is_mentioned
+            false, // in_thread (main channel)
+            false, // involved
+            true,  // other_bot_present is ignored
+        ));
+    }
+
+    /// GIVEN: all mode, multi-bot thread
+    /// WHEN:  human sends message without @mention
+    /// THEN:  bot responds because all mode ignores participation/multibot gating
+    #[test]
+    fn all_mode_multi_bot_thread_no_mention() {
+        assert!(should_process_user_message(
+            AllowUsers::All,
+            false, // is_mentioned
+            true,  // in_thread
+            false, // involved is ignored
+            true,  // other_bot_present is ignored
+        ));
+    }
 
     /// GIVEN: multibot-mentions mode, single-bot thread, bot is involved
     /// WHEN:  human sends message without @mention

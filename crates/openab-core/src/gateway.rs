@@ -932,6 +932,7 @@ pub async fn run_gateway_adapter(
                                         display_name: event.sender.display_name.clone(),
                                         channel: event.channel.channel_type.clone(),
                                         channel_id: event.channel.id.clone(),
+                                        input_source: "text".into(),
                                         thread_id: event.channel.thread_id.clone(),
                                         is_bot: event.sender.is_bot,
                                         // Gateway: use event timestamp if available, else broker receive time
@@ -1412,6 +1413,7 @@ pub async fn process_gateway_event(
         display_name: event.sender.display_name.clone(),
         channel: event.channel.channel_type.clone(),
         channel_id: event.channel.id.clone(),
+        input_source: "text".into(),
         thread_id: event.channel.thread_id.clone(),
         is_bot: event.sender.is_bot,
         timestamp: Some(if event.timestamp.is_empty() {

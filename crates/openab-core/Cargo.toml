@@ -55,6 +55,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tempfile = "3.27.0"
 
 [features]
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]

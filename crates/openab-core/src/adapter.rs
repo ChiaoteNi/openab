@@ -1,15 +1,24 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
-use crate::config::{ReactionsConfig, ToolDisplay};
+use crate::config::{ReactionsConfig, ToolDisplay, UploadsConfig};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+
+const VOICE_TRANSCRIPT_PREFIX: &str = "[Voice message transcript]:";
+const STT_CONFIRMATION_GATE: &str = "\
+[OpenAB STT confirmation gate]
+This inbound user message contains a voice-message transcript. Before doing any requested work:
+1. Reply in Traditional Chinese with a concise bullet list of what you understand the user wants.
+2. Ask the user to confirm or correct that interpretation.
+3. Do not run tools, dispatch agents, edit files, or perform external side effects until the user confirms.";
 
 // --- Output directive parsing ---
 
@@ -259,6 +268,11 @@ pub struct MessageRef {
     pub message_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct OutgoingAttachment {
+    pub path: PathBuf,
+}
+
 /// Bundles per-message parameters for `AdapterRouter::handle_message`.
 ///
 /// Introduced to reduce parameter count and make the signature extensible
@@ -289,6 +303,13 @@ pub struct SenderContext {
     pub display_name: String,
     pub channel: String,
     pub channel_id: String,
+    /// Origin of the user-visible input delivered to the agent.
+    ///
+    /// Chat adapters use:
+    /// - `text`: typed text, or no successful STT transcript
+    /// - `voice_transcript`: audio-only input transcribed by STT
+    /// - `mixed`: typed text plus a successful STT transcript
+    pub input_source: String,
     /// Thread identifier, if the message is inside a thread.
     /// Slack: thread_ts. Discord: thread channel ID (channel_id holds the parent).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +345,23 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
+
+    /// Send a new message with local file attachments. Default: unsupported.
+    async fn send_message_with_attachments(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        attachments: &[OutgoingAttachment],
+    ) -> Result<MessageRef> {
+        if attachments.is_empty() {
+            self.send_message(channel, content).await
+        } else {
+            Err(anyhow::anyhow!(
+                "file uploads are not supported by the {} adapter",
+                self.platform()
+            ))
+        }
+    }
 
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
@@ -464,6 +502,10 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Agent-requested local file uploads. Populated via
+    /// [`AdapterRouter::with_uploads`]; default is disabled, which makes any
+    /// upload directive in agent output an error rather than a silent no-op.
+    uploads_config: UploadsConfig,
 }
 
 impl AdapterRouter {
@@ -494,6 +536,7 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            uploads_config: UploadsConfig::default(),
         }
     }
 
@@ -501,6 +544,11 @@ impl AdapterRouter {
     /// Keeps `new()`'s signature stable across its many call sites.
     pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
         self.trust = trust;
+        self
+    }
+
+    pub fn with_uploads(mut self, uploads_config: UploadsConfig) -> Self {
+        self.uploads_config = uploads_config;
         self
     }
 
@@ -562,7 +610,21 @@ impl AdapterRouter {
         let (texts, others): (Vec<_>, Vec<_>) = extra_blocks
             .into_iter()
             .partition(|b| matches!(b, ContentBlock::Text { .. }));
-        let mut blocks = Vec::with_capacity(2 + texts.len() + others.len());
+        // A voice transcript reached the agent without the user being able to
+        // proofread it, so the STT gate is prepended ahead of everything else.
+        let has_voice_transcript = texts.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text } if text.starts_with(VOICE_TRANSCRIPT_PREFIX)
+            )
+        });
+        let mut blocks =
+            Vec::with_capacity(2 + texts.len() + others.len() + usize::from(has_voice_transcript));
+        if has_voice_transcript {
+            blocks.push(ContentBlock::Text {
+                text: STT_CONFIRMATION_GATE.to_string(),
+            });
+        }
         blocks.push(ContentBlock::Text { text: header });
         blocks.extend(texts);
         if !prompt.is_empty() {
@@ -728,6 +790,7 @@ impl AdapterRouter {
             self.table_mode
         };
         let tool_display = self.reactions_config.tool_display;
+        let uploads_config = self.uploads_config.clone();
         // ACP streams over an append-only `agent_message_chunk`; a re-rendered tool-status
         // prefix from `compose_display` would corrupt the deltas, so ACP streams the raw
         // append-only answer text and surfaces tools separately (review F2 / roadmap).
@@ -1133,6 +1196,24 @@ impl AdapterRouter {
                         final_content
                     };
 
+                    // Agent-requested uploads: strip the fenced directive out of the
+                    // reply text before chunking so the block is never shown, then
+                    // deliver the validated files after the text lands.
+                    let (final_content, upload_paths) = extract_upload_directives(&final_content);
+                    let (attachments, upload_error) =
+                        match prepare_uploads(&uploads_config, upload_paths) {
+                            Ok(attachments) => (attachments, None),
+                            Err(e) => (Vec::new(), Some(e.to_string())),
+                        };
+                    let final_content = match (&upload_error, final_content.trim().is_empty()) {
+                        (Some(err), true) => format!("⚠️ {err}"),
+                        (Some(err), false) => format!("{final_content}\n\n⚠️ {err}"),
+                        (None, true) if !attachments.is_empty() => {
+                            format!("Uploaded {} file(s).", attachments.len())
+                        }
+                        (None, _) => final_content,
+                    };
+
                     let final_content = markdown::convert_tables(&final_content, table_mode);
                     let chunks = if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);
@@ -1347,6 +1428,18 @@ impl AdapterRouter {
                         }
                     }
 
+                    // Attachments follow the text. Discord caps a message at 10 files,
+                    // so batch; any failure counts as an incomplete user view.
+                    for batch in attachments.chunks(10) {
+                        if let Err(e) = adapter
+                            .send_message_with_attachments(&thread_channel, "", batch)
+                            .await
+                        {
+                            tracing::warn!(error = ?e, platform = %thread_channel.platform, files = batch.len(), "attachment batch send failed");
+                            delivery_failed = true;
+                        }
+                    }
+
                     if delivery_failed {
                         Err(anyhow::anyhow!(
                             "streaming finalization had delivery failures; user view is incomplete"
@@ -1358,6 +1451,150 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// Classify `SenderContext::input_source` from what the adapter actually received.
+///
+/// Shared by every chat adapter so `voice_transcript` means the same thing on
+/// each platform — downstream STT confirmation gates key off this value.
+pub fn classify_input_source(has_text_prompt: bool, has_voice_transcript: bool) -> &'static str {
+    match (has_text_prompt, has_voice_transcript) {
+        (true, true) => "mixed",
+        (false, true) => "voice_transcript",
+        _ => "text",
+    }
+}
+
+/// Pull `openab-upload` fenced blocks out of agent output.
+///
+/// Returns the reply text with those blocks removed, plus the raw paths listed
+/// inside them (unvalidated — see [`prepare_uploads`]).
+fn extract_upload_directives(text: &str) -> (String, Vec<String>) {
+    let mut out = Vec::new();
+    let mut paths = Vec::new();
+    let mut in_upload_block = false;
+    let mut skip_blank_after_upload_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if skip_blank_after_upload_block {
+            skip_blank_after_upload_block = false;
+            if trimmed.is_empty() {
+                continue;
+            }
+        }
+        if !in_upload_block && is_upload_fence_start(trimmed) {
+            in_upload_block = true;
+            continue;
+        }
+        if in_upload_block {
+            if trimmed == "```" {
+                in_upload_block = false;
+                skip_blank_after_upload_block = true;
+                continue;
+            }
+            if let Some(path) = parse_upload_path_line(trimmed) {
+                paths.push(path);
+            }
+            continue;
+        }
+        out.push(line);
+    }
+
+    (out.join("\n").trim().to_string(), paths)
+}
+
+fn is_upload_fence_start(line: &str) -> bool {
+    matches!(
+        line,
+        "```openab-upload" | "```openab-uploads" | "```openab-send-images"
+    )
+}
+
+fn parse_upload_path_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line.strip_prefix("- ").unwrap_or(line).trim();
+    Some(line.trim_matches('"').trim_matches('\'').to_string())
+}
+
+/// Validate agent-requested paths against `[uploads]` policy.
+///
+/// OpenAB runs outside the agent's sandbox, so every path is canonicalized and
+/// confined to `allowed_roots` before it can be read.
+fn prepare_uploads(
+    config: &UploadsConfig,
+    raw_paths: Vec<String>,
+) -> Result<Vec<OutgoingAttachment>> {
+    if raw_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !config.enabled {
+        anyhow::bail!("agent requested file upload, but [uploads].enabled is false");
+    }
+    if raw_paths.len() > config.max_files {
+        anyhow::bail!(
+            "agent requested {} uploads, exceeding [uploads].max_files ({})",
+            raw_paths.len(),
+            config.max_files
+        );
+    }
+
+    let allowed_roots = canonical_allowed_roots(&config.allowed_roots)?;
+    let mut uploads = Vec::with_capacity(raw_paths.len());
+    for raw_path in raw_paths {
+        let path = PathBuf::from(&raw_path);
+        if !path.is_absolute() {
+            anyhow::bail!("upload path must be absolute: {raw_path}");
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("failed to resolve upload path {raw_path}: {e}"))?;
+        if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            anyhow::bail!(
+                "upload path {} is outside [uploads].allowed_roots",
+                canonical.display()
+            );
+        }
+        let metadata = std::fs::metadata(&canonical).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read upload metadata {}: {e}",
+                canonical.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!("upload path is not a file: {}", canonical.display());
+        }
+        if metadata.len() > config.max_file_bytes {
+            anyhow::bail!(
+                "upload file {} is {} bytes, exceeding [uploads].max_file_bytes ({})",
+                canonical.display(),
+                metadata.len(),
+                config.max_file_bytes
+            );
+        }
+        uploads.push(OutgoingAttachment { path: canonical });
+    }
+    Ok(uploads)
+}
+
+fn canonical_allowed_roots(raw_roots: &[String]) -> Result<Vec<PathBuf>> {
+    if raw_roots.is_empty() {
+        anyhow::bail!(
+            "[uploads].allowed_roots must contain at least one path when uploads are enabled"
+        );
+    }
+    raw_roots
+        .iter()
+        .map(|root| {
+            let path = Path::new(root);
+            path.canonicalize().map_err(|e| {
+                anyhow::anyhow!("failed to resolve upload root {}: {e}", path.display())
+            })
+        })
+        .collect()
 }
 
 /// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
@@ -1931,6 +2168,150 @@ mod tests {
         // renders_native_tables defaults to false: platforms that don't override
         // it keep the table→code/bullets conversion (e.g. Discord, Gateway).
         assert!(!adapter.renders_native_tables("discord"));
+    }
+
+    #[test]
+    fn stt_transcript_blocks_are_prefixed_with_confirmation_gate() {
+        let blocks = AdapterRouter::pack_arrival_event(
+            "{}",
+            "",
+            vec![ContentBlock::Text {
+                text: "[Voice message transcript]: 幫我看目前狀態".into(),
+            }],
+        );
+
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            matches!(&blocks[0], ContentBlock::Text { text } if text.contains("STT confirmation gate")),
+            "expected first block to be the STT gate: {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[1], ContentBlock::Text { text } if text.contains("<sender_context>")),
+            "expected sender context to follow the gate: {blocks:?}"
+        );
+        assert!(
+            matches!(&blocks[2], ContentBlock::Text { text } if text.starts_with("[Voice message transcript]:")),
+            "expected transcript to be preserved: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_blocks_do_not_trigger_stt_confirmation_gate() {
+        let blocks = AdapterRouter::pack_arrival_event(
+            "{}",
+            "",
+            vec![ContentBlock::Text {
+                text: "[Attached text file: notes.txt]\nhello".into(),
+            }],
+        );
+
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            blocks.iter().all(|b| !matches!(b, ContentBlock::Text { text } if text.contains("STT confirmation gate"))),
+            "ordinary text attachment should not trigger STT gate: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn classify_input_source_covers_text_voice_and_mixed() {
+        assert_eq!(classify_input_source(true, false), "text");
+        assert_eq!(classify_input_source(false, true), "voice_transcript");
+        assert_eq!(classify_input_source(true, true), "mixed");
+        assert_eq!(classify_input_source(false, false), "text");
+    }
+
+    #[test]
+    fn extract_upload_directives_strips_block_and_collects_paths() {
+        let input = "Here are the screenshots.\n\n```openab-upload\n# comment\n\"/tmp/a.png\"\n- /tmp/b with spaces.jpg\n```\n\nDone.";
+        let (visible, paths) = extract_upload_directives(input);
+        assert_eq!(visible, "Here are the screenshots.\n\nDone.");
+        assert_eq!(
+            paths,
+            vec![
+                "/tmp/a.png".to_string(),
+                "/tmp/b with spaces.jpg".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_upload_directives_leaves_ordinary_text_untouched() {
+        let input = "no directives here\n\n```rust\nfn main() {}\n```";
+        let (visible, paths) = extract_upload_directives(input);
+        assert_eq!(visible, input);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn prepare_uploads_rejects_disabled_config() {
+        let err = prepare_uploads(&UploadsConfig::default(), vec!["/tmp/a.png".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[uploads].enabled is false"));
+    }
+
+    #[test]
+    fn prepare_uploads_accepts_file_under_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("a.png");
+        std::fs::write(&image, b"png").unwrap();
+        let config = UploadsConfig {
+            enabled: true,
+            allowed_roots: vec![dir.path().display().to_string()],
+            max_files: 10,
+            max_file_bytes: 1024,
+        };
+
+        let uploads = prepare_uploads(&config, vec![image.display().to_string()]).unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].path.ends_with("a.png"));
+    }
+
+    /// The confinement check is the whole point of [`prepare_uploads`]: OpenAB
+    /// reads these paths outside the agent sandbox.
+    #[test]
+    fn prepare_uploads_rejects_path_outside_allowed_root() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"nope").unwrap();
+        let config = UploadsConfig {
+            enabled: true,
+            allowed_roots: vec![allowed.path().display().to_string()],
+            max_files: 10,
+            max_file_bytes: 1024,
+        };
+
+        let err = prepare_uploads(&config, vec![secret.display().to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside [uploads].allowed_roots"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn prepare_uploads_rejects_more_files_than_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let config = UploadsConfig {
+            enabled: true,
+            allowed_roots: vec![dir.path().display().to_string()],
+            max_files: 1,
+            max_file_bytes: 1024,
+        };
+
+        let err = prepare_uploads(
+            &config,
+            vec![a.display().to_string(), b.display().to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_files"), "unexpected error: {err}");
     }
 
     #[test]

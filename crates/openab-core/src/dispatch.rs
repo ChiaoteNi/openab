@@ -1086,10 +1086,11 @@ mod tests {
             vec![],
         ));
         // M1: header + prompt + image = 3
-        // M2: header + transcript = 2 (empty prompt → no prompt block)
+        // M2: STT gate + header + transcript = 3 (empty prompt → no prompt block;
+        //     the gate is a local extension, see STT_CONFIRMATION_GATE)
         // M3: header + prompt = 2
-        // total = 7
-        assert_eq!(all.len(), 7);
+        // total = 8
+        assert_eq!(all.len(), 8);
         if let ContentBlock::Text { text } = &all[0] {
             assert!(text.contains(r#""ts":"T1""#));
             assert!(!text.contains("look at this"));
@@ -1098,20 +1099,26 @@ mod tests {
             assert_eq!(text, "look at this");
         }
         assert!(matches!(&all[2], ContentBlock::Image { .. }));
+        // A transcript arrival opens with the STT confirmation gate.
         if let ContentBlock::Text { text } = &all[3] {
+            assert!(text.contains("STT confirmation gate"));
+        } else {
+            panic!("expected STT gate Text block before M2 delimiter");
+        }
+        if let ContentBlock::Text { text } = &all[4] {
             assert!(text.contains(r#""ts":"T2""#));
         }
         // Transcript precedes prompt (and prompt is omitted here because empty).
-        if let ContentBlock::Text { text } = &all[4] {
+        if let ContentBlock::Text { text } = &all[5] {
             assert!(text.contains("Voice message transcript"));
             assert!(text.contains("sync about the deploy"));
         } else {
             panic!("expected transcript Text block after M2 delimiter");
         }
-        if let ContentBlock::Text { text } = &all[5] {
+        if let ContentBlock::Text { text } = &all[6] {
             assert!(text.contains(r#""sender_id":"B""#));
         }
-        if let ContentBlock::Text { text } = &all[6] {
+        if let ContentBlock::Text { text } = &all[7] {
             assert_eq!(text, "what?");
         }
     }

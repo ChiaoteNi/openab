@@ -711,6 +711,7 @@ async fn fire_cronjob(
         sender_name: job.sender_name.clone(),
         display_name: job.sender_name.clone(),
         channel: job.platform.clone(),
+        input_source: "scheduled".into(),
         channel_id: reply_channel
             .parent_id
             .as_deref()

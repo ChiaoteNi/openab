@@ -468,6 +468,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if cfg.uploads.enabled && cfg.uploads.allowed_roots.is_empty() {
+        cfg.uploads
+            .allowed_roots
+            .push(cfg.agent.working_dir.clone());
+    }
+    let uploads_config = cfg.uploads.clone();
+
     let pool = Arc::new(acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
@@ -745,7 +752,8 @@ async fn main() -> anyhow::Result<()> {
                 "/tmp".into()
             })),
         )
-        .with_trust(gateway_trust),
+        .with_trust(gateway_trust)
+        .with_uploads(uploads_config),
     );
 
     // Shutdown signal for Slack adapter

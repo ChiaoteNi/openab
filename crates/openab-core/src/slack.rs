@@ -1,5 +1,5 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{classify_input_source, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
@@ -1159,6 +1159,7 @@ pub async fn run_slack_adapter(
                                                         // DM: implicit mention — always process
                                                     } else {
                                                         match allow_user_messages {
+                                                            AllowUsers::All => {}
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }
@@ -1483,6 +1484,7 @@ async fn handle_message(
     // can still @-mention other users in its reply.
     let bot_id = adapter.get_bot_user_id().await;
     let prompt = resolve_slack_mentions(&text, bot_id);
+    let has_text_prompt = !prompt.is_empty();
 
     // Process file attachments (images, audio)
     let files = event["files"].as_array();
@@ -1498,6 +1500,7 @@ async fn handle_message(
     const TEXT_FILE_COUNT_CAP: u32 = 5;
 
     let mut extra_blocks = Vec::new();
+    let mut has_voice_transcript = false;
     let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
     let mut text_file_bytes: u64 = 0;
     let mut text_file_count: u32 = 0;
@@ -1534,6 +1537,7 @@ async fn handle_message(
                                 chars = transcript.len(),
                                 "voice transcript injected"
                             );
+                            has_voice_transcript = true;
                             extra_blocks.insert(
                                 0,
                                 ContentBlock::Text {
@@ -1729,6 +1733,7 @@ async fn handle_message(
         display_name,
         channel: "slack".into(),
         channel_id: channel_id.clone(),
+        input_source: classify_input_source(has_text_prompt, has_voice_transcript).into(),
         thread_id: thread_ts.clone(),
         is_bot: is_bot_msg,
         timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),

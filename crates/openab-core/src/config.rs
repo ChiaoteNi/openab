@@ -219,6 +219,8 @@ pub struct Config {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub ambient: AmbientConfig,
+    #[serde(default)]
+    pub uploads: UploadsConfig,
     /// Optional filestore configuration for uploading large text attachments.
     #[cfg(feature = "filestore")]
     pub filestore: Option<FilestoreConfig>,
@@ -509,8 +511,9 @@ fn default_max_batch_tokens() -> usize {
     24_000
 }
 
-/// Controls whether the bot responds to user messages in threads without @mention.
+/// Controls whether the bot responds to user messages without @mention.
 ///
+/// - `All`: respond to every allowed user message in allowed channels/threads.
 /// - `Involved`: respond to thread messages only if the bot has participated
 ///   in the thread (posted at least one message, or the thread parent @mentions the bot).
 ///   Channel/MPDM messages always require @mention. DMs always process (implicit mention).
@@ -523,18 +526,20 @@ pub enum AllowUsers {
     Mentions,
     #[default]
     MultibotMentions,
+    All,
 }
 
 impl<'de> Deserialize<'de> for AllowUsers {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         match s.to_lowercase().replace('-', "_").as_str() {
+            "all" | "true" => Ok(Self::All),
             "involved" => Ok(Self::Involved),
             "mentions" => Ok(Self::Mentions),
             "multibot_mentions" => Ok(Self::MultibotMentions),
             other => Err(serde::de::Error::unknown_variant(
                 other,
-                &["involved", "mentions", "multibot-mentions"],
+                &["all", "involved", "mentions", "multibot-mentions"],
             )),
         }
     }
@@ -1519,6 +1524,24 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadsConfig {
+    /// Allow agent replies to request local file uploads via fenced directives.
+    /// Disabled by default because OpenAB runs outside the child-process sandbox.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Canonical path prefixes that may be uploaded. Empty means the agent
+    /// working_dir is used at startup when uploads are enabled.
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+    /// Max number of files a single agent response may upload.
+    #[serde(default = "default_upload_max_files")]
+    pub max_files: usize,
+    /// Max size of each file in bytes.
+    #[serde(default = "default_upload_max_file_bytes")]
+    pub max_file_bytes: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PoolConfig {
     #[serde(default = "default_max_sessions")]
@@ -1770,6 +1793,23 @@ fn default_done_hold_ms() -> u64 {
 }
 fn default_error_hold_ms() -> u64 {
     2_500
+}
+fn default_upload_max_files() -> usize {
+    10
+}
+fn default_upload_max_file_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+impl Default for UploadsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_roots: Vec::new(),
+            max_files: default_upload_max_files(),
+            max_file_bytes: default_upload_max_file_bytes(),
+        }
+    }
 }
 
 impl Default for PoolConfig {
@@ -3158,6 +3198,43 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+        assert!(!cfg.uploads.enabled);
+    }
+
+    #[test]
+    fn parse_discord_allow_user_messages_all() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+allow_user_messages = "all"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.discord.unwrap().allow_user_messages, AllowUsers::All);
+    }
+
+    #[test]
+    fn parse_uploads_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[uploads]
+enabled = true
+allowed_roots = ["/tmp/openab"]
+max_files = 3
+max_file_bytes = 1234
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.uploads.enabled);
+        assert_eq!(cfg.uploads.allowed_roots, vec!["/tmp/openab"]);
+        assert_eq!(cfg.uploads.max_files, 3);
+        assert_eq!(cfg.uploads.max_file_bytes, 1234);
     }
 
     #[test]

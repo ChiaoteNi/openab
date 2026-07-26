@@ -79,7 +79,7 @@ Discord adapter. Requires a Discord bot token.
 | `allowed_users` | string[] | `[]` | User IDs to allow. Only checked when `allow_all_users` resolves to false. |
 | `allow_bot_messages` | string | `"off"` | `"off"` — ignore all bot messages. `"mentions"` — only process bot messages that @mention this bot. `"all"` — process all bot messages (capped by `max_bot_turns`). |
 | `trusted_bot_ids` | string[] | `[]` | When non-empty, only these bot IDs pass the bot gate. Empty = any bot (mode permitting). **Admission override:** a trusted bot that @mentions this bot bypasses `allow_bot_messages` mode entirely (treated as human @mention, can pull bot into threads). |
-| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread (recommended for multi-bot deployments). `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. |
+| `allow_user_messages` | string | `"multibot-mentions"` | `"multibot-mentions"` — like `"involved"`, but require @mention once another bot has posted in the thread (recommended for multi-bot deployments). `"involved"` — reply in threads bot has participated in without @mention; channel messages require @mention; DMs always process. `"mentions"` — always require @mention. `"all"` — reply to every allowed user message; participation and multi-bot gating are ignored. |
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
 | `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
 | `message_processing_mode` | string | `"per-message"` | Message dispatch mode: `"per-message"` (each message = own turn), `"per-thread"` (all messages in thread share one buffer), or `"per-lane"` (each sender gets own buffer). See [Message Dispatch Modes](message-dispatch-modes.md). |
@@ -595,6 +595,40 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 | `model` | string | `"whisper-large-v3-turbo"` | Model name to use for transcription. |
 | `base_url` | string | `"https://api.groq.com/openai/v1"` | Base URL of the STT API. Any OpenAI-compatible `/audio/transcriptions` endpoint works. |
 | `echo_transcript` | bool | `false` | When set to `true` and STT runs, post a `> 🎤 <transcript>` message to the thread before the agent reply so users can verify what was heard. Failures show `(transcription failed)` and add a ⚠️ reaction to the original message. |
+
+When a transcript is produced, the arrival is also tagged
+`sender_context.input_source = "voice_transcript"` (or `"mixed"` when the user
+typed text alongside the audio), and an STT confirmation-gate block is prepended
+to the prompt so the agent restates its understanding before acting. Typed
+messages are `"text"`; scheduled `[cron]` jobs are `"scheduled"`.
+
+---
+
+## `[uploads]`
+
+Lets an agent reply attach local files by emitting a fenced block:
+
+````
+```openab-upload
+/abs/path/to/a.png
+- /abs/path/to/b.jpg
+```
+````
+
+The block is stripped from the visible reply and the files are posted as
+attachments. Disabled by default: OpenAB reads these paths on the host, outside
+the agent's sandbox, so every path must be absolute and resolve inside
+`allowed_roots`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Honor upload directives. When `false`, a directive is reported back as an error instead of being silently dropped. |
+| `allowed_roots` | array | `[]` | Canonical path prefixes that may be uploaded. Empty means `[agent] working_dir` is used at startup. |
+| `max_files` | int | `10` | Max files a single agent response may upload. |
+| `max_file_bytes` | int | `26214400` | Max size per file (25 MB). |
+
+Only the Discord adapter implements uploads; other adapters return an
+"uploads are not supported" error.
 
 ---
 

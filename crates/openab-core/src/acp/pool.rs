@@ -43,6 +43,28 @@ struct PoolState {
     session_workdirs: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PoolStatus {
+    pub max_sessions: usize,
+    pub active: Vec<PoolActiveSession>,
+    pub suspended: Vec<PoolSuspendedSession>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolActiveSession {
+    pub thread_id: String,
+    pub session_id: Option<String>,
+    pub busy: bool,
+    pub alive: Option<bool>,
+    pub idle_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolSuspendedSession {
+    pub thread_id: String,
+    pub session_id: String,
+}
+
 pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
@@ -239,6 +261,65 @@ impl SessionPool {
             std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.meta_path))
         {
             warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
+        }
+    }
+
+    /// Snapshot of pool occupancy for the `/sessions` slash command.
+    ///
+    /// Never blocks on a connection mutex: a held lock means the session is
+    /// mid-prompt, which is reported as `busy` rather than waited on.
+    pub async fn status(&self) -> PoolStatus {
+        let (max_sessions, active_snapshot, mut suspended) = {
+            let state = self.state.read().await;
+            let active_snapshot = state
+                .active
+                .iter()
+                .map(|(thread_id, conn)| {
+                    let cancel_session_id = state
+                        .cancel_handles
+                        .get(thread_id)
+                        .map(|(_, session_id)| session_id.clone());
+                    (thread_id.clone(), Arc::clone(conn), cancel_session_id)
+                })
+                .collect::<Vec<_>>();
+            let suspended = state
+                .suspended
+                .iter()
+                .map(|(thread_id, session_id)| PoolSuspendedSession {
+                    thread_id: thread_id.clone(),
+                    session_id: session_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            (self.max_sessions, active_snapshot, suspended)
+        };
+
+        let mut active = Vec::with_capacity(active_snapshot.len());
+        for (thread_id, conn, cancel_session_id) in active_snapshot {
+            match conn.try_lock() {
+                Ok(conn) => active.push(PoolActiveSession {
+                    thread_id,
+                    session_id: conn.acp_session_id.clone().or(cancel_session_id),
+                    busy: false,
+                    alive: Some(conn.alive()),
+                    idle_seconds: Some(conn.last_active.elapsed().as_secs()),
+                }),
+                Err(_) => active.push(PoolActiveSession {
+                    thread_id,
+                    session_id: cancel_session_id,
+                    busy: true,
+                    alive: None,
+                    idle_seconds: None,
+                }),
+            }
+        }
+
+        active.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+        suspended.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+
+        PoolStatus {
+            max_sessions,
+            active,
+            suspended,
         }
     }
 
